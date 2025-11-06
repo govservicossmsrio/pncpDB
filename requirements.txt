@@ -1,1 +1,1 @@
-pandas requests gspread google-auth google-cloud-bigquery pandas-gbq
+pandas aiohttp aiogspread google-auth google-cloud-bigquery pandas-gbq
