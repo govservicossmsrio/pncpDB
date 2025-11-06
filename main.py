@@ -7,6 +7,7 @@ from datetime import datetime
 import pandas as pd
 from google.oauth2 import service_account
 from google.cloud import bigquery
+from google.api_core import exceptions
 import gspread
 
 # --- CONFIGURAÇÃO DE LOG ---
@@ -48,36 +49,25 @@ def get_google_sheets_client(credentials):
     ]))
 
 def get_pncp_data(endpoint_key, id_param, param_type="codigo"):
-    """Função aprimorada para buscar dados da API PNCP com log de erro robusto."""
     url = f"{CONFIG['PNCP_BASE_URL']}/{CONFIG['ENDPOINTS'][endpoint_key]}"
     params = {'tipo': 'idCompra', param_type: id_param}
     
     try:
         response = requests.get(url, params=params, timeout=30)
-        # Lança uma exceção para códigos de status 4xx/5xx.
         response.raise_for_status()
-
         if not response.content:
             logging.warning(f"Resposta vazia da API para {url} com params {params}.")
             return []
-        
-        # O .json() pode falhar se a resposta não for um JSON válido.
         return response.json()
-
     except requests.exceptions.HTTPError as http_err:
-        # Erro HTTP retornado pela API (4xx, 5xx)
         logging.error(f"Erro HTTP para ID {id_param} no endpoint {endpoint_key}. Status: {http_err.response.status_code}. Resposta: {http_err.response.text}")
-        raise  # Re-lança a exceção para ser capturada pela lógica de retentativa
-
-    except ValueError as json_err:
-        # Erro ao decodificar a resposta JSON
+        raise
+    except ValueError:
         logging.error(f"Falha ao decodificar JSON da API para ID {id_param}. Resposta recebida: {response.text[:200]}...")
-        raise json_err
-
+        raise
     except requests.exceptions.RequestException as req_err:
-        # Erros de conexão, timeout, etc.
         logging.error(f"Erro de rede/conexão para ID {id_param}: {req_err}")
-        raise req_err
+        raise
 
 def load_data_to_bigquery(df, table_name, credentials):
     if df.empty:
@@ -98,21 +88,16 @@ def load_data_to_bigquery(df, table_name, credentials):
         logging.error(f"Falha ao carregar dados na tabela '{table_name}' do BigQuery. Erro: {e}")
         raise
 
-def process_single_id(pncp_id, existing_ids, credentials):
+def process_single_id(pncp_id, credentials):
     try:
-        # 1. Obter dados de Contratações
         contratacoes_data = get_pncp_data("CONTRATACOES", pncp_id)
         if not contratacoes_data:
             logging.warning(f"Nenhum dado de contratação encontrado para o ID {pncp_id}. Pulando.")
             return
 
-        # 2. Obter dados de Itens
         itens_data = get_pncp_data("ITENS", pncp_id)
-
-        # 3. Obter dados de Resultados
         resultados_data = get_pncp_data("RESULTADOS", pncp_id)
 
-        # Processamento e carga no BigQuery
         contratacoes_df = pd.DataFrame(contratacoes_data)
         load_data_to_bigquery(contratacoes_df, 'contratacoes', credentials)
         
@@ -125,7 +110,6 @@ def process_single_id(pncp_id, existing_ids, credentials):
             load_data_to_bigquery(resultados_df, 'resultados', credentials)
 
     except Exception as e:
-        # Este log agora será muito mais informativo, pois `e` conterá a exceção específica.
         logging.warning(f"Falha ao processar completamente o ID: {pncp_id}. Detalhes: {e}")
         raise e
 
@@ -137,16 +121,27 @@ def main():
         credentials = get_gcp_credentials()
         gs_client = get_google_sheets_client(credentials)
         
+        # **CORREÇÃO 1: IGNORAR CABEÇALHO**
         logging.info("Lendo IDs da planilha Google Sheets...")
         sheet = gs_client.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["SHEET_NAME"])
-        ids_from_sheet = [row[0] for row in sheet.get_all_values() if row and row[0].strip()]
+        all_rows = sheet.get_all_values()
+        # Pula a primeira linha (cabeçalho) usando slice [1:]
+        ids_from_sheet = [row[0] for row in all_rows[1:] if row and row[0].strip()]
         logging.info(f"Encontrados {len(ids_from_sheet)} IDs na planilha.")
 
+        # **CORREÇÃO 2: CONSULTA ROBUSTA AO BIGQUERY**
         bq_client = bigquery.Client(credentials=credentials, project=CONFIG["GCP_PROJECT_ID"])
-        query = f"SELECT DISTINCT idCompra FROM `{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.contratacoes`"
-        existing_ids = set(bq_client.query(query).to_dataframe()['idCompra'].astype(str))
+        query = f"SELECT DISTINCT CAST(idCompra AS STRING) as idCompra FROM `{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.contratacoes`"
+        existing_ids = set()
+        try:
+            query_job = bq_client.query(query)
+            df_existing = query_job.to_dataframe()
+            if not df_existing.empty:
+                existing_ids = set(df_existing['idCompra'])
+        except exceptions.NotFound:
+            logging.warning("Tabela 'contratacoes' não encontrada. Assumindo que nenhum ID existe (primeira execução).")
         
-        ids_to_process = [id_val for id_val in ids_from_sheet if str(id_val) not in existing_ids]
+        ids_to_process = [id_val for id_val in ids_from_sheet if id_val not in existing_ids]
         logging.info(f"Após filtragem, {len(ids_to_process)} IDs a serem processados.")
         
     except Exception as e:
@@ -164,7 +159,7 @@ def main():
             logging.info(f"Processando ID: {item} (Tentativa {retry_counts[item]})")
             
             try:
-                process_single_id(item, existing_ids, credentials)
+                process_single_id(item, credentials)
                 ids_to_process.remove(item)
                 batch_failed = False
                 consecutive_failures = 0
