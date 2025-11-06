@@ -1,6 +1,5 @@
 pandas
 aiohttp
-aiogspread
 google-auth
 google-cloud-bigquery
 pandas-gbq
