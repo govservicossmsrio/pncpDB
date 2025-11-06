@@ -1,0 +1,31 @@
+name: PNCP Pipeline
+
+on:
+  workflow_dispatch:
+
+  # Schedule
+  schedule:
+    - cron: '0 9,15 * * *'
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Usando uma versão moderna e estável do Python.
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ETL Script
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: python main.py
