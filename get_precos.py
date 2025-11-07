@@ -29,7 +29,7 @@ CONFIG = {
     "SUCCESS_DELAY_SECONDS": 2,
     "MAX_RETRIES_PER_ITEM": 3,
     "RETRY_DELAY_SECONDS": 5,
-    "MAX_CONSECUTIVE_FAILURES": 30,  # Limite global de falhas consecutivas
+    "MAX_CONSECUTIVE_FAILURES": 30,
 }
 
 # =====================================================
@@ -103,7 +103,7 @@ def get_db_connection():
 
 def get_pending_codes() -> List[Tuple[str, str]]:
     """
-    Retorna lista de (coditemcatalogo, tipo) priorizando:
+    Retorna lista de (codigoitemcatalogo, tipo) priorizando:
     1. Códigos nunca buscados
     2. Códigos mais antigos (data_extracao ASC)
     """
@@ -114,11 +114,11 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         query = """
         WITH codigos_itens AS (
             SELECT DISTINCT 
-                coditemcatalogo,
+                codigoitemcatalogo,
                 LOWER(materialouserviconome) as tipo_lower
             FROM itens_compra
-            WHERE coditemcatalogo IS NOT NULL 
-              AND coditemcatalogo != ''
+            WHERE codigoitemcatalogo IS NOT NULL 
+              AND codigoitemcatalogo != ''
               AND materialouserviconome IS NOT NULL
         ),
         codigos_processados AS (
@@ -129,18 +129,18 @@ def get_pending_codes() -> List[Tuple[str, str]]:
             GROUP BY codigoitemcatalogo
         )
         SELECT 
-            ci.coditemcatalogo,
+            ci.codigoitemcatalogo,
             CASE 
                 WHEN ci.tipo_lower LIKE '%material%' THEN 'MATERIAL'
                 WHEN ci.tipo_lower LIKE '%servi%' THEN 'SERVICO'
                 ELSE 'MATERIAL'
             END as tipo
         FROM codigos_itens ci
-        LEFT JOIN codigos_processados cp ON ci.coditemcatalogo = cp.codigoitemcatalogo
+        LEFT JOIN codigos_processados cp ON ci.codigoitemcatalogo = cp.codigoitemcatalogo
         ORDER BY 
             CASE WHEN cp.codigoitemcatalogo IS NULL THEN 0 ELSE 1 END,
             cp.ultima_extracao ASC NULLS FIRST,
-            ci.coditemcatalogo
+            ci.codigoitemcatalogo
         """
         
         cursor.execute(query)
@@ -154,6 +154,8 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         
     except Exception as e:
         logger.error(f"Erro ao buscar códigos pendentes: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return []
 
 # =====================================================
@@ -389,7 +391,7 @@ def main():
         total = len(pending_codes)
         processed = 0
         failed = 0
-        consecutive_failures = 0  # Contador global de falhas consecutivas
+        consecutive_failures = 0
         
         for i in range(0, len(pending_codes), CONFIG["BATCH_SIZE"]):
             batch = pending_codes[i:i + CONFIG["BATCH_SIZE"]]
@@ -421,12 +423,12 @@ def main():
                 
                 if success:
                     processed += 1
-                    consecutive_failures = 0  # RESET contador ao ter sucesso
+                    consecutive_failures = 0
                     logger.info(f"✅ Sucesso | Falhas consecutivas resetadas para 0")
                     time.sleep(CONFIG["SUCCESS_DELAY_SECONDS"])
                 else:
                     failed += 1
-                    consecutive_failures += 1  # INCREMENTA contador
+                    consecutive_failures += 1
                     logger.error(f"❌ Código {codigo} falhou após {CONFIG['MAX_RETRIES_PER_ITEM']} tentativas")
                     logger.warning(f"⚠️  Falhas consecutivas: {consecutive_failures}/{CONFIG['MAX_CONSECUTIVE_FAILURES']}")
             
