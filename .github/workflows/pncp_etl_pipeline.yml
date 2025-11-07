@@ -2,8 +2,8 @@ name: PNCP Pipeline
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 9,15 * * *'
+ # schedule:
+   # - cron: '0 9,15 * * *'
 
 jobs:
   run-etl:
