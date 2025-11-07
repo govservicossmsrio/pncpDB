@@ -20,8 +20,8 @@ CONFIG = {
         "COCKROACH_CONNECTION_STRING",
         "postgresql://sgc_admin:<password>@scary-quetzal-18026.j77.aws-us-east-1.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full"
     ),
-    "SPREADSHEET_ID": os.getenv("SPREADSHEET_ID", "your-spreadsheet-id"),
-    "SHEET_NAME": "Sheet1",
+    "SPREADSHEET_ID": "18P9l9_g-QE-DWsfRCokY18M5RLZe7mV-CWY1bfw6hlA",
+    "SHEET_NAME": "idLista",
     "PNCP_BASE_URL": "https://pncp.gov.br/api/consulta/v1",
     "ENDPOINTS": {
         "compras": "contratacoes/publicacao/{id_compra}",
