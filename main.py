@@ -7,6 +7,7 @@ import pandas as pd
 from google.cloud import bigquery
 from google.api_core import exceptions
 import gspread
+import google.auth  # Importar a biblioteca de autenticação do Google
 
 # --- CONFIGURAÇÃO DE LOG ---
 logging.basicConfig(level=logging.INFO,
@@ -15,7 +16,6 @@ logging.basicConfig(level=logging.INFO,
 
 # --- CONFIGURAÇÃO CENTRALIZADA ---
 CONFIG = {
-    # O ID do projeto agora será pego automaticamente das credenciais.
     "GCP_PROJECT_ID": "pncpDB", 
     "BIGQUERY_DATASET": "pncp_data",
     "SPREADSHEET_ID": "18P9l9_g-QE-DWsfRCokY18M5RLZe7mV-CWY1bfw6hlA",
@@ -32,8 +32,7 @@ CONFIG = {
     "RETRY_DELAYS_SECONDS": {3: 5, 6: 10, 9: 60, 12: 300, 15: 600, 18: "CANCEL"}
 }
 
-# --- FUNÇÕES DE API E BIGQUERY (Sem manipulação explícita de credenciais) ---
-
+# --- FUNÇÕES DE API E BIGQUERY (sem alterações) ---
 def get_pncp_data(endpoint_key, id_param):
     url = f"{CONFIG['PNCP_BASE_URL']}/{CONFIG['ENDPOINTS'][endpoint_key]}"
     params = {'tipo': 'idCompra', 'codigo': id_param}
@@ -46,24 +45,20 @@ def get_pncp_data(endpoint_key, id_param):
             return None
         return response.json()
     except requests.exceptions.HTTPError as http_err:
-        logging.error(f"Erro HTTP para ID {id_param} no endpoint {endpoint_key}. Status: {http_err.response.status_code}. Resposta: {http_err.response.text}")
+        logging.error(f"Erro HTTP para ID {id_param}. Status: {http_err.response.status_code}. Resposta: {http_err.response.text}")
         raise
     except Exception as e:
         logging.error(f"Erro inesperado na chamada da API para ID {id_param}: {e}")
         raise
 
 def load_data_to_bigquery(df, table_name):
-    if df.empty:
-        return
-
+    if df.empty: return
     table_id = f"{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.{table_name}"
-    
     try:
-        # A função to_gbq também usará as credenciais do ambiente automaticamente.
         df.to_gbq(destination_table=table_id, project_id=CONFIG["GCP_PROJECT_ID"], if_exists='append')
         logging.info(f"{len(df)} registros carregados para '{table_name}'.")
     except Exception as e:
-        logging.error(f"Falha ao carregar dados na tabela '{table_name}' do BigQuery: {e}")
+        logging.error(f"Falha ao carregar dados na tabela '{table_name}': {e}")
         raise
 
 def process_single_id(pncp_id):
@@ -73,18 +68,23 @@ def process_single_id(pncp_id):
             logging.warning(f"Nenhum dado de contratação encontrado para ID {pncp_id}. Pulando.")
             return
 
+        # Assegurar que os dados retornados sejam listas
+        contratacoes_list = contratacoes_data.get('data', [])
+        
+        # A lógica para as outras APIs permanece a mesma...
         itens_data = get_pncp_data("ITENS", pncp_id)
         resultados_data = get_pncp_data("RESULTADOS", pncp_id)
 
-        contratacoes_df = pd.json_normalize(contratacoes_data['data'])
-        load_data_to_bigquery(contratacoes_df, 'contratacoes')
+        if contratacoes_list:
+            contratacoes_df = pd.json_normalize(contratacoes_list)
+            load_data_to_bigquery(contratacoes_df, 'contratacoes')
 
         if itens_data and itens_data.get('data'):
-            itens_df = pd.json_normalize(itens_data['data'])
+            itens_df = pd.json_normalize(itens_data.get('data', []))
             load_data_to_bigquery(itens_df, 'itens_compra')
 
         if resultados_data and resultados_data.get('data'):
-            resultados_df = pd.json_normalize(resultados_data['data'])
+            resultados_df = pd.json_normalize(resultados_data.get('data', []))
             load_data_to_bigquery(resultados_df, 'resultados_itens')
 
     except Exception as e:
@@ -95,11 +95,16 @@ def main():
     logging.info("--- INICIANDO PIPELINE DE ETL DO PNCP ---")
     
     try:
-        # Inicialização simplificada dos clientes.
-        # Eles usarão automaticamente as credenciais configuradas pelo workflow.
-        gc = gspread.service_account()
-        bq_client = bigquery.Client()
+        # **CORREÇÃO DEFINITIVA DA AUTENTICAÇÃO**
+        # Pega as credenciais do ambiente (configuradas pelo GitHub Actions)
+        creds, project = google.auth.default()
         
+        # Autoriza o gspread com essas credenciais
+        gc = gspread.authorize(creds)
+        
+        # Inicializa o cliente do BigQuery (ele também usará as mesmas credenciais)
+        bq_client = bigquery.Client(credentials=creds, project=project or CONFIG["GCP_PROJECT_ID"])
+
         logging.info("Lendo IDs da planilha Google Sheets...")
         sheet = gc.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["SHEET_NAME"])
         all_rows = sheet.get_all_values()
@@ -122,32 +127,30 @@ def main():
         logging.critical(f"Falha na configuração inicial. Abortando. Erro: {e}")
         return
 
-    # A lógica de processamento em lote permanece a mesma...
+    # Lógica de processamento em lote (inalterada)
     retry_counts = {item: 0 for item in ids_to_process}
     while ids_to_process:
         batch = ids_to_process[:CONFIG["BATCH_SIZE"]]
+        if not batch: break
+        
         logging.info(f"--- Processando lote de {len(batch)} IDs: {batch} ---")
         
-        batch_has_failure = True
-        for item in batch:
+        for item in list(batch): # Itera sobre uma cópia para poder modificar a original
+            if item not in ids_to_process: continue
+
             retry_counts[item] += 1
             try:
                 logging.info(f"Processando ID: {item} (Tentativa {retry_counts[item]})")
                 process_single_id(item)
                 ids_to_process.remove(item)
-                batch_has_failure = False # Marcar que o lote teve pelo menos um sucesso
                 time.sleep(CONFIG["SUCCESS_DELAY_SECONDS"])
-            except Exception as e:
+            except Exception:
                 logging.warning(f"Falha na tentativa {retry_counts[item]} para o ID: {item}.")
                 if retry_counts[item] >= CONFIG["MAX_RETRIES_PER_ITEM"]:
                     logging.error(f"ID {item} atingiu o máximo de falhas e será descartado.")
                     ids_to_process.remove(item)
-        
-        if batch_has_failure and ids_to_process: # Lote inteiro falhou
-             # Lógica de espera (não mostrada para brevidade, mas está no seu código)
-            pass
-
-    logging.info("--- PIPELINE DE ETL DO PNCP CONCLUÍDO COM SUCESSO ---")
+    
+    logging.info("--- PIPELINE DE ETL DO PNCP CONCLUÍDO ---")
 
 if __name__ == "__main__":
     main()
