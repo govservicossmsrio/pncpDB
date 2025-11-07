@@ -30,6 +30,11 @@ CONFIG = {
     "MAX_RETRIES_PER_ITEM": 3,
     "RETRY_DELAY_SECONDS": 5,
     "MAX_CONSECUTIVE_FAILURES": 30,
+    "SCRIPT_VERSION": "v1.0.0",
+    
+    # ===== MODO TESTE =====
+    "MODO_TESTE": True,  # True = usar TESTE_CODIGOS | False = processar todos
+    "TESTE_CODIGOS": ["439495", "321787", "321786", "338605"],  # Códigos para testar
 }
 
 # =====================================================
@@ -43,45 +48,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =====================================================
-# SCHEMA PRECOS_CATALOGO (MINÚSCULAS)
+# SCHEMA PRECOS_CATALOGO (baseado no Schema.txt original)
 # =====================================================
 
 PRECOS_SCHEMA = {
     "idcompra": "STRING",
-    "iditemcompra": "STRING",
-    "forma": "STRING",
-    "modalidade": "STRING",
-    "criteriojulgamento": "STRING",
     "numeroitemcompra": "INTEGER",
-    "descricaoitem": "STRING",
-    "codigoitemcatalogo": "STRING",
-    "nomeunidademedida": "STRING",
-    "siglaunidademedida": "STRING",
-    "nomeunidadefornecimento": "STRING",
-    "siglaunidadefornecimento": "STRING",
-    "capacidadeunidadefornecimento": "FLOAT",
-    "quantidade": "FLOAT",
-    "precounitario": "FLOAT",
-    "percentualmaiordesconto": "FLOAT",
+    "coditemcatalogo": "STRING",
+    "unidadeorgaocodigounidade": "STRING",
+    "unidadeorgaonomeunidade": "STRING",
+    "unidadeorgaouf": "STRING",
+    "descricaodetalhada": "STRING",
+    "quantidadehomologada": "FLOAT",
+    "unidademedida": "STRING",
+    "valorunitariohomologado": "FLOAT",
+    "percentualdesconto": "FLOAT",
+    "marca": "STRING",
     "nifornecedor": "STRING",
     "nomefornecedor": "STRING",
-    "marca": "STRING",
-    "codigouasg": "STRING",
-    "nomeuasg": "STRING",
-    "codigomunicipio": "STRING",
-    "municipio": "STRING",
-    "estado": "STRING",
-    "codigoorgao": "STRING",
-    "nomeorgao": "STRING",
-    "poder": "STRING",
-    "esfera": "STRING",
     "datacompra": "DATE",
-    "datahoraatualizacaocompra": "TIMESTAMP",
-    "datahoraatualizacaoitem": "TIMESTAMP",
-    "dataresultado": "DATE",
-    "datahoraatualizacaouasg": "TIMESTAMP",
-    "codigoclasse": "STRING",
-    "nomeclasse": "STRING",
 }
 
 # =====================================================
@@ -106,8 +91,63 @@ def get_pending_codes() -> List[Tuple[str, str]]:
     Retorna lista de (codigo_catalogo, tipo) priorizando:
     1. Códigos nunca buscados
     2. Códigos mais antigos (data_extracao ASC)
+    
+    Se MODO_TESTE = True, retorna apenas códigos de TESTE_CODIGOS
     """
     try:
+        # ===== MODO TESTE =====
+        if CONFIG["MODO_TESTE"]:
+            logger.warning("⚠️  MODO TESTE ATIVADO ⚠️")
+            logger.warning(f"Processando apenas códigos: {CONFIG['TESTE_CODIGOS']}")
+            
+            # Buscar tipo de cada código de teste
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Verificar qual coluna existe
+            cursor.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'itens_compra' 
+                  AND column_name IN ('coditemcatalogo', 'codigoitemcatalogo')
+            """)
+            
+            result = cursor.fetchone()
+            col_itens = result[0] if result else 'coditemcatalogo'
+            
+            # Buscar tipo de cada código de teste
+            test_codes = []
+            for codigo in CONFIG["TESTE_CODIGOS"]:
+                cursor.execute(f"""
+                    SELECT DISTINCT LOWER(materialouserviconome)
+                    FROM itens_compra
+                    WHERE TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_itens}, '\.0+$', ''))) = %s
+                    LIMIT 1
+                """, (codigo,))
+                
+                result = cursor.fetchone()
+                if result:
+                    tipo_lower = result[0]
+                    if 'material' in tipo_lower:
+                        tipo = 'MATERIAL'
+                    elif 'servi' in tipo_lower:
+                        tipo = 'SERVICO'
+                    else:
+                        tipo = 'MATERIAL'
+                    test_codes.append((codigo, tipo))
+                    logger.info(f"Código teste: {codigo} → {tipo}")
+                else:
+                    # Se não encontrar no banco, assumir MATERIAL
+                    logger.warning(f"Código {codigo} não encontrado em itens_compra, assumindo MATERIAL")
+                    test_codes.append((codigo, 'MATERIAL'))
+            
+            cursor.close()
+            conn.close()
+            
+            logger.info(f"Total de códigos em MODO TESTE: {len(test_codes)}")
+            return test_codes
+        
+        # ===== MODO NORMAL =====
         conn = get_db_connection()
         cursor = conn.cursor()
         
@@ -130,19 +170,7 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         col_itens = result_itens[0]
         logger.info(f"Usando coluna em itens_compra: {col_itens}")
         
-        # Verificar qual coluna existe em precos_catalogo
-        cursor.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'precos_catalogo' 
-              AND column_name IN ('coditemcatalogo', 'codigoitemcatalogo')
-        """)
-        
-        result_precos = cursor.fetchone()
-        col_precos = result_precos[0] if result_precos else 'codigoitemcatalogo'
-        logger.info(f"Usando coluna em precos_catalogo: {col_precos}")
-        
-        # Query com limpeza do .0 e .00
+        # Query com limpeza do .0
         query = f"""
         WITH codigos_itens AS (
             SELECT DISTINCT 
@@ -155,10 +183,10 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         ),
         codigos_processados AS (
             SELECT DISTINCT 
-                TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_precos}, '\.0+$', ''))) as codigo,
+                TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE(coditemcatalogo, '\.0+$', ''))) as codigo,
                 MAX(data_extracao) as ultima_extracao
             FROM precos_catalogo
-            GROUP BY TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_precos}, '\.0+$', '')))
+            GROUP BY TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE(coditemcatalogo, '\.0+$', '')))
         )
         SELECT 
             ci.codigo,
@@ -309,25 +337,53 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = df.columns.str.lower().str.strip()
     return df
 
-def map_and_clean_dataframe(df: pd.DataFrame, schema: Dict[str, str]) -> pd.DataFrame:
-    """Mapeia e limpa DataFrame conforme schema"""
+def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Mapeia colunas do CSV para o schema do banco"""
     if df.empty:
-        return pd.DataFrame(columns=list(schema.keys()) + ['data_extracao'])
+        return pd.DataFrame(columns=list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script'])
     
     # Normalizar nomes de colunas
     df = normalize_column_names(df)
     
+    # Mapeamento explícito CSV → Banco
+    mapping = {
+        'idcompra': 'idcompra',
+        'numeroitemcompra': 'numeroitemcompra',
+        'codigoitemcatalogo': 'coditemcatalogo',
+        'codigouasg': 'unidadeorgaocodigounidade',
+        'nomeuasg': 'unidadeorgaonomeunidade',
+        'estado': 'unidadeorgaouf',
+        'descricaoitem': 'descricaodetalhada',
+        'quantidade': 'quantidadehomologada',
+        'siglaunidademedida': 'unidademedida',
+        'precounitario': 'valorunitariohomologado',
+        'percentualmaiordesconto': 'percentualdesconto',
+        'marca': 'marca',
+        'nifornecedor': 'nifornecedor',
+        'nomefornecedor': 'nomefornecedor',
+        'datacompra': 'datacompra',
+    }
+    
     result_df = pd.DataFrame()
     
-    # Mapear colunas do schema
-    for col, dtype in schema.items():
-        if col in df.columns:
-            result_df[col] = convert_column_type(df[col], dtype)
+    # Mapear colunas
+    for csv_col, schema_col in mapping.items():
+        if csv_col in df.columns:
+            result_df[schema_col] = convert_column_type(df[csv_col], PRECOS_SCHEMA.get(schema_col, "STRING"))
         else:
-            result_df[col] = None
-            logger.debug(f"Coluna {col} não encontrada no CSV")
+            result_df[schema_col] = None
+            logger.debug(f"Coluna {csv_col} não encontrada no CSV")
     
+    # Adicionar colunas que não estão no CSV mas são do schema
+    for col in PRECOS_SCHEMA.keys():
+        if col not in result_df.columns:
+            result_df[col] = None
+    
+    # Adicionar metadados
     result_df['data_extracao'] = datetime.utcnow()
+    result_df['versao_script'] = CONFIG["SCRIPT_VERSION"]
+    
+    logger.info(f"✓ Mapeado {len(result_df)} registros do CSV para o schema")
     
     return result_df
 
@@ -345,16 +401,18 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        columns = list(PRECOS_SCHEMA.keys()) + ['data_extracao']
+        columns = list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script']
         placeholders = ', '.join(['%s'] * len(columns))
         columns_str = ', '.join(columns)
         
-        # Usar iditemcompra como chave única
+        # PRIMARY KEY composta: (idcompra, numeroitemcompra)
         insert_query = f"""
             INSERT INTO precos_catalogo ({columns_str})
             VALUES ({placeholders})
-            ON CONFLICT (idcompraitem)
-            DO UPDATE SET data_extracao = EXCLUDED.data_extracao
+            ON CONFLICT (idcompra, numeroitemcompra)
+            DO UPDATE SET 
+                data_extracao = EXCLUDED.data_extracao,
+                versao_script = EXCLUDED.versao_script
         """
         
         # Preparar dados
@@ -396,7 +454,7 @@ def process_single_code(codigo: str, tipo: str) -> bool:
             return False
         
         # Transformar dados
-        df_clean = map_and_clean_dataframe(df_raw, PRECOS_SCHEMA)
+        df_clean = map_csv_to_schema(df_raw)
         
         # Carregar no banco
         success = load_precos_to_cockroach(df_clean)
@@ -415,7 +473,15 @@ def process_single_code(codigo: str, tipo: str) -> bool:
 
 def main():
     """Orquestração principal do pipeline de preços"""
-    logger.info("=== Iniciando Pipeline de Preços de Catálogo ===")
+    
+    # Mostrar modo de execução
+    if CONFIG["MODO_TESTE"]:
+        logger.info("="*60)
+        logger.info("⚠️  EXECUTANDO EM MODO TESTE ⚠️")
+        logger.info(f"Códigos a processar: {CONFIG['TESTE_CODIGOS']}")
+        logger.info("="*60)
+    else:
+        logger.info("=== Iniciando Pipeline de Preços de Catálogo (MODO PRODUÇÃO) ===")
     
     try:
         # 1. Buscar códigos pendentes
@@ -472,7 +538,8 @@ def main():
             
         
         # 3. Relatório final
-        logger.info("\n=== Pipeline Concluído ===")
+        modo = "TESTE" if CONFIG["MODO_TESTE"] else "PRODUÇÃO"
+        logger.info(f"\n=== Pipeline Concluído (MODO {modo}) ===")
         logger.info(f"Total: {total} códigos")
         logger.info(f"Sucesso: {processed}")
         logger.info(f"Falhas: {failed}")
