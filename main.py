@@ -8,6 +8,7 @@ from google.cloud import bigquery
 from google.api_core import exceptions
 import gspread
 import google.auth
+import numpy as np
 
 # --- CONFIGURAÇÃO DE LOG ---
 logging.basicConfig(level=logging.INFO,
@@ -32,69 +33,77 @@ CONFIG = {
     "RETRY_DELAYS_SECONDS": {3: 5, 6: 10, 9: 60, 12: 300, 15: 600, 18: "CANCEL"}
 }
 
-# Mapeamento de campos
-COMPRAS_FIELD_MAPPING = {
-    'idCompra': 'idCompra',
-    'numeroCompra': 'numeroCompra',
-    'anoCompraPncp': 'anoCompraPncp',
-    'codigoModalidade': 'codigoModalidade',
-    'modalidadeNome': 'modalidadeNome',
-    'srp': 'srp',
-    'unidadeOrgaoCodigoUnidade': 'unidadeOrgaoCodigoUnidade',
-    'unidadeOrgaoNomeUnidade': 'unidadeOrgaoNomeUnidade',
-    'unidadeOrgaoMunicipioNome': 'unidadeOrgaoMunicipioNome',
-    'unidadeOrgaoUfSigla': 'unidadeOrgaoUfSigla',
-    'orgaoEntidadeEsferaId': 'orgaoEntidadeEsferaId',
-    'processo': 'processo',
-    'objetoCompra': 'objetoCompra',
-    'valorTotalEstimado': 'valorTotalEstimado',
-    'valorTotalHomologado': 'valorTotalHomologado',
-    'existeResultado': 'existeResultado',
-    'dataAberturaPropostaPncp': 'dataAberturaPropostaPncp',
-    'contratacaoExcluida': 'contratacaoExcluida'
+# Mapeamento de campos e seus tipos (conforme schema do BigQuery)
+COMPRAS_SCHEMA = {
+    'idCompra': 'STRING',
+    'numeroCompra': 'STRING',
+    'anoCompraPncp': 'INTEGER',
+    'codigoModalidade': 'INTEGER',
+    'modalidadeNome': 'STRING',
+    'srp': 'BOOLEAN',
+    'unidadeOrgaoCodigoUnidade': 'INTEGER',
+    'unidadeOrgaoNomeUnidade': 'STRING',
+    'unidadeOrgaoMunicipioNome': 'STRING',
+    'unidadeOrgaoUfSigla': 'STRING',
+    'orgaoEntidadeEsferaId': 'INTEGER',
+    'processo': 'STRING',
+    'objetoCompra': 'STRING',
+    'valorTotalEstimado': 'FLOAT',
+    'valorTotalHomologado': 'FLOAT',
+    'existeResultado': 'BOOLEAN',
+    'dataAberturaPropostaPncp': 'TIMESTAMP',
+    'contratacaoExcluida': 'BOOLEAN',
+    'dataExtracao': 'TIMESTAMP',
+    'itensTotal': 'INTEGER',
+    'itensResultados': 'INTEGER',
+    'itensHomologados': 'INTEGER',
+    'itensFracassados': 'INTEGER',
+    'itensDesertos': 'INTEGER',
+    'itensOutros': 'INTEGER'
 }
 
-ITENS_FIELD_MAPPING = {
-    'idCompraItem': 'idCompraItem',
-    'idCompra': 'idCompra',
-    'numeroItemCompra': 'numeroItemCompra',
-    'numeroGrupo': 'numeroGrupo',
-    'materialOuServicoNome': 'materialOuServicoNome',
-    'tipoBeneficioNome': 'tipoBeneficioNome',
-    'codItemCatalogo': 'codItemCatalogo',
-    'descricaoResumida': 'descricaoResumida',
-    'descricaodetalhada': 'descricaodetalhada',
-    'quantidade': 'quantidade',
-    'unidadeMedida': 'unidadeMedida',
-    'valorUnitarioEstimado': 'valorUnitarioEstimado',
-    'valorTotal': 'valorTotal',
-    'temResultado': 'temResultado',
-    'situacaoCompraItemNome': 'situacaoCompraItemNome',
-    'cnpjFornecedor': 'cnpjFornecedor',
-    'nomeFornecedor': 'nomeFornecedor'
+ITENS_SCHEMA = {
+    'idCompraItem': 'STRING',
+    'idCompra': 'STRING',
+    'numeroItemCompra': 'INTEGER',
+    'numeroGrupo': 'INTEGER',
+    'materialOuServicoNome': 'STRING',
+    'tipoBeneficioNome': 'STRING',
+    'codItemCatalogo': 'INTEGER',
+    'descricaoResumida': 'STRING',
+    'descricaodetalhada': 'STRING',
+    'quantidade': 'FLOAT',
+    'unidadeMedida': 'STRING',
+    'valorUnitarioEstimado': 'FLOAT',
+    'valorTotal': 'FLOAT',
+    'temResultado': 'BOOLEAN',
+    'situacaoCompraItemNome': 'STRING',
+    'cnpjFornecedor': 'STRING',
+    'nomeFornecedor': 'STRING',
+    'data_extracao': 'TIMESTAMP'
 }
 
-RESULTADOS_FIELD_MAPPING = {
-    'idCompraItem': 'idCompraItem',
-    'idCompra': 'idCompra',
-    'niFornecedor': 'niFornecedor',
-    'tipoPessoa': 'tipoPessoa',
-    'nomeRazaoSocialFornecedor': 'nomeRazaoSocialFornecedor',
-    'naturezaJuridicaNome': 'naturezaJuridicaNome',
-    'porteFornecedorNome': 'porteFornecedorNome',
-    'quantidadeHomologada': 'quantidadeHomologada',
-    'valorUnitarioHomologado': 'valorUnitarioHomologado',
-    'valorTotalHomologado': 'valorTotalHomologado',
-    'percentualDesconto': 'percentualDesconto',
-    'dataResultadoPncp': 'dataResultadoPncp',
-    'aplicacaoBeneficioMeepp': 'aplicacaoBeneficioMeepp',
-    'moedaEstrangeiraId': 'moedaEstrangeiraId',
-    'dataCotacaoMoedaEstrangeira': 'dataCotacaoMoedaEstrangeira',
-    'valorNominalMoedaEstrangeira': 'valorNominalMoedaEstrangeira',
-    'paisOrigemProdutoServicoId': 'paisOrigemProdutoServicoId'
+RESULTADOS_SCHEMA = {
+    'idCompraItem': 'STRING',
+    'idCompra': 'STRING',
+    'niFornecedor': 'STRING',
+    'tipoPessoa': 'STRING',
+    'nomeRazaoSocialFornecedor': 'STRING',
+    'naturezaJuridicaNome': 'STRING',
+    'porteFornecedorNome': 'STRING',
+    'quantidadeHomologada': 'FLOAT',
+    'valorUnitarioHomologado': 'FLOAT',
+    'valorTotalHomologado': 'FLOAT',
+    'percentualDesconto': 'FLOAT',
+    'dataResultadoPncp': 'TIMESTAMP',
+    'aplicacaoBeneficioMeepp': 'BOOLEAN',
+    'moedaEstrangeiraId': 'STRING',
+    'dataCotacaoMoedaEstrangeira': 'TIMESTAMP',
+    'valorNominalMoedaEstrangeira': 'FLOAT',
+    'paisOrigemProdutoServicoId': 'INTEGER',
+    'data_extracao': 'TIMESTAMP'
 }
 
-# Cliente BigQuery global (será inicializado no main)
 BQ_CLIENT = None
 
 def get_pncp_data(endpoint_key, id_param):
@@ -114,30 +123,49 @@ def get_pncp_data(endpoint_key, id_param):
         logging.error(f"Erro inesperado na chamada da API para ID {id_param}: {e}")
         raise
 
-def map_and_clean_dataframe(df, field_mapping):
-    """Mapeia campos e converte para strings todos os valores para máxima compatibilidade."""
+def convert_column_type(series, target_type):
+    """Converte uma coluna pandas para o tipo especificado no schema do BigQuery."""
+    try:
+        if target_type == 'STRING':
+            return series.astype(str).replace(['nan', 'None', '<NA>'], None)
+        elif target_type == 'INTEGER':
+            return pd.to_numeric(series, errors='coerce').fillna(0).astype('Int64')
+        elif target_type == 'FLOAT':
+            return pd.to_numeric(series, errors='coerce')
+        elif target_type == 'BOOLEAN':
+            return series.astype(bool)
+        elif target_type == 'TIMESTAMP':
+            return pd.to_datetime(series, errors='coerce')
+        else:
+            return series
+    except Exception as e:
+        logging.warning(f"Erro ao converter coluna para tipo {target_type}: {e}. Retornando como string.")
+        return series.astype(str)
+
+def map_and_clean_dataframe(df, schema):
+    """Mapeia campos e converte tipos baseado no schema da tabela."""
     if df.empty:
         return df
     
-    available_fields = {api_field: bq_field for api_field, bq_field in field_mapping.items() if api_field in df.columns}
-    df_mapped = df[list(available_fields.keys())].copy()
-    df_mapped = df_mapped.rename(columns=available_fields)
+    # Seleciona apenas campos que existem no schema E no DataFrame
+    available_fields = [field for field in schema.keys() if field in df.columns]
+    df_mapped = df[available_fields].copy()
     
-    # Converte TUDO para string - máxima compatibilidade
-    # O BigQuery fará a conversão para os tipos corretos do schema automaticamente
-    for col in df_mapped.columns:
-        df_mapped[col] = df_mapped[col].astype(str)
-        # Substitui 'nan', 'None', '<NA>' por None real
-        df_mapped[col] = df_mapped[col].replace(['nan', 'None', '<NA>', 'NaN'], None)
+    # Converte cada coluna para o tipo correto
+    for col, target_type in schema.items():
+        if col in df_mapped.columns:
+            df_mapped[col] = convert_column_type(df_mapped[col], target_type)
     
     # Adiciona timestamp de extração
-    if 'data_extracao' in field_mapping.values() and 'data_extracao' not in df_mapped.columns:
-        df_mapped['data_extracao'] = datetime.utcnow().isoformat()
+    if 'data_extracao' in schema and 'data_extracao' not in df_mapped.columns:
+        df_mapped['data_extracao'] = datetime.utcnow()
+    if 'dataExtracao' in schema and 'dataExtracao' not in df_mapped.columns:
+        df_mapped['dataExtracao'] = datetime.utcnow()
     
     return df_mapped
 
-def load_data_to_bigquery(df, table_name, field_mapping):
-    """Carrega dados usando o cliente nativo do BigQuery (método mais confiável)."""
+def load_data_to_bigquery(df, table_name, schema):
+    """Carrega dados usando o cliente nativo do BigQuery."""
     if df.empty: 
         logging.info(f"DataFrame vazio para '{table_name}', nada a carregar.")
         return
@@ -145,14 +173,13 @@ def load_data_to_bigquery(df, table_name, field_mapping):
     table_id = f"{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.{table_name}"
     
     try:
-        df_clean = map_and_clean_dataframe(df, field_mapping)
+        df_clean = map_and_clean_dataframe(df, schema)
         
         logging.info(f"Carregando {len(df_clean)} registro(s) com {len(df_clean.columns)} campos na tabela '{table_name}'...")
         
-        # SOLUÇÃO DEFINITIVA: Usar cliente BigQuery nativo
         job_config = bigquery.LoadJobConfig(
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-            autodetect=False  # Usa o schema existente da tabela
+            autodetect=False
         )
         
         job = BQ_CLIENT.load_table_from_dataframe(
@@ -161,7 +188,6 @@ def load_data_to_bigquery(df, table_name, field_mapping):
             job_config=job_config
         )
         
-        # Aguarda conclusão do job
         job.result()
         
         logging.info(f"✓ {len(df_clean)} registro(s) carregado(s) com sucesso na tabela '{table_name}'.")
@@ -185,17 +211,17 @@ def process_single_id(pncp_id):
         if contratacoes_list:
             df = pd.json_normalize(contratacoes_list)
             logging.info(f"ID {pncp_id}: {len(df)} registro(s) de contratação encontrado(s).")
-            load_data_to_bigquery(df, 'compras', COMPRAS_FIELD_MAPPING)
+            load_data_to_bigquery(df, 'compras', COMPRAS_SCHEMA)
 
         if itens_data and itens_data.get('resultado'):
             df = pd.json_normalize(itens_data.get('resultado', []))
             logging.info(f"ID {pncp_id}: {len(df)} item(ns) de compra encontrado(s).")
-            load_data_to_bigquery(df, 'itens_compra', ITENS_FIELD_MAPPING)
+            load_data_to_bigquery(df, 'itens_compra', ITENS_SCHEMA)
 
         if resultados_data and resultados_data.get('resultado'):
             df = pd.json_normalize(resultados_data.get('resultado', []))
             logging.info(f"ID {pncp_id}: {len(df)} resultado(s) de item encontrado(s).")
-            load_data_to_bigquery(df, 'resultados_itens', RESULTADOS_FIELD_MAPPING)
+            load_data_to_bigquery(df, 'resultados_itens', RESULTADOS_SCHEMA)
 
     except Exception as e:
         logging.warning(f"Falha ao processar completamente o ID {pncp_id}.")
