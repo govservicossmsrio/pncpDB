@@ -9,6 +9,7 @@ from io import StringIO
 import psycopg2
 from psycopg2.extras import execute_batch
 from typing import Dict, List, Optional, Tuple
+import re
 
 # =====================================================
 # CONFIGURAÇÃO
@@ -33,8 +34,8 @@ CONFIG = {
     "SCRIPT_VERSION": "v1.0.0",
     
     # ===== MODO TESTE =====
-    "MODO_TESTE": True,  # True = usar TESTE_CODIGOS | False = processar todos
-    "TESTE_CODIGOS": ["439495", "321787", "321786", "338605"],  # Códigos para testar
+    "MODO_TESTE": True,
+    "TESTE_CODIGOS": ["439495"],
 }
 
 # =====================================================
@@ -48,7 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =====================================================
-# SCHEMA PRECOS_CATALOGO (baseado no Schema.txt original)
+# SCHEMA PRECOS_CATALOGO
 # =====================================================
 
 PRECOS_SCHEMA = {
@@ -70,6 +71,21 @@ PRECOS_SCHEMA = {
 }
 
 # =====================================================
+# FUNÇÕES AUXILIARES (do código antigo)
+# =====================================================
+
+def normalizar_nome_coluna(nome: str) -> str:
+    """Converte CamelCase para snake_case"""
+    if not isinstance(nome, str):
+        return ''
+    s = nome.strip()
+    # camelCase → snake_case: idCompra → id_compra
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+    # Remove caracteres especiais
+    s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
+    return s.lower().strip('_')
+
+# =====================================================
 # CONEXÃO COM COCKROACHDB
 # =====================================================
 
@@ -87,24 +103,15 @@ def get_db_connection():
 # =====================================================
 
 def get_pending_codes() -> List[Tuple[str, str]]:
-    """
-    Retorna lista de (codigo_catalogo, tipo) priorizando:
-    1. Códigos nunca buscados
-    2. Códigos mais antigos (data_extracao ASC)
-    
-    Se MODO_TESTE = True, retorna apenas códigos de TESTE_CODIGOS
-    """
+    """Retorna lista de (codigo_catalogo, tipo)"""
     try:
-        # ===== MODO TESTE =====
         if CONFIG["MODO_TESTE"]:
             logger.warning("⚠️  MODO TESTE ATIVADO ⚠️")
             logger.warning(f"Processando apenas códigos: {CONFIG['TESTE_CODIGOS']}")
             
-            # Buscar tipo de cada código de teste
             conn = get_db_connection()
             cursor = conn.cursor()
             
-            # Verificar qual coluna existe
             cursor.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
@@ -115,7 +122,6 @@ def get_pending_codes() -> List[Tuple[str, str]]:
             result = cursor.fetchone()
             col_itens = result[0] if result else 'coditemcatalogo'
             
-            # Buscar tipo de cada código de teste
             test_codes = []
             for codigo in CONFIG["TESTE_CODIGOS"]:
                 cursor.execute(f"""
@@ -128,17 +134,9 @@ def get_pending_codes() -> List[Tuple[str, str]]:
                 result = cursor.fetchone()
                 if result:
                     tipo_lower = result[0]
-                    if 'material' in tipo_lower:
-                        tipo = 'MATERIAL'
-                    elif 'servi' in tipo_lower:
-                        tipo = 'SERVICO'
-                    else:
-                        tipo = 'MATERIAL'
+                    tipo = 'MATERIAL' if 'material' in tipo_lower else 'SERVICO'
                     test_codes.append((codigo, tipo))
-                    logger.info(f"Código teste: {codigo} → {tipo}")
                 else:
-                    # Se não encontrar no banco, assumir MATERIAL
-                    logger.warning(f"Código {codigo} não encontrado em itens_compra, assumindo MATERIAL")
                     test_codes.append((codigo, 'MATERIAL'))
             
             cursor.close()
@@ -147,11 +145,9 @@ def get_pending_codes() -> List[Tuple[str, str]]:
             logger.info(f"Total de códigos em MODO TESTE: {len(test_codes)}")
             return test_codes
         
-        # ===== MODO NORMAL =====
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Verificar qual coluna existe em itens_compra
         cursor.execute("""
             SELECT column_name 
             FROM information_schema.columns 
@@ -162,15 +158,13 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         result_itens = cursor.fetchone()
         
         if not result_itens:
-            logger.error("Nenhuma coluna de código de catálogo encontrada em itens_compra")
+            logger.error("Nenhuma coluna de código de catálogo encontrada")
             cursor.close()
             conn.close()
             return []
         
         col_itens = result_itens[0]
-        logger.info(f"Usando coluna em itens_compra: {col_itens}")
         
-        # Query com limpeza do .0
         query = f"""
         WITH codigos_itens AS (
             SELECT DISTINCT 
@@ -224,10 +218,7 @@ def get_pending_codes() -> List[Tuple[str, str]]:
 # =====================================================
 
 def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
-    """
-    Busca todas as páginas de um código na API correspondente
-    Retorna DataFrame consolidado ou None
-    """
+    """Busca todas as páginas de um código"""
     try:
         endpoint = CONFIG["ENDPOINTS"][tipo]
         url = f"{CONFIG['PNCP_BASE_URL']}/{endpoint}"
@@ -241,7 +232,6 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
                 'codigoItemCatalogo': codigo
             }
             
-            # Adicionar tamanhoPagina apenas para Material
             if tipo == "MATERIAL":
                 params['tamanhoPagina'] = CONFIG["PAGE_SIZE"]
             
@@ -250,54 +240,50 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             
-            # Decodificar com UTF-8 para caracteres especiais
             content = response.content.decode('utf-8-sig')
             
             if not content.strip():
-                logger.warning(f"Resposta vazia para código {codigo} na página {pagina}")
                 break
             
-            # Remover última linha de metadados (totalRegistros: ...)
             lines = content.strip().split('\n')
             if lines and 'totalRegistros:' in lines[-1]:
                 lines = lines[:-1]
             
-            if len(lines) <= 1:  # Apenas header ou vazio
-                logger.info(f"Sem mais dados na página {pagina}")
+            if len(lines) <= 1:
                 break
             
             clean_csv = '\n'.join(lines)
             
-            # Parse CSV
-            df_page = pd.read_csv(StringIO(clean_csv), sep='\t', encoding='utf-8')
+            # CORREÇÃO: Usar separador ; (não \t)
+            df_page = pd.read_csv(
+                StringIO(clean_csv),
+                sep=';',  # ← MUDOU de \t para ;
+                encoding='utf-8',
+                on_bad_lines='warn',
+                engine='python',
+                dtype=str
+            )
             
             if df_page.empty:
-                logger.info(f"DataFrame vazio na página {pagina}")
                 break
             
             all_data.append(df_page)
             
-            # Verificar se há próxima página (inferir do tamanho)
             if len(df_page) < CONFIG["PAGE_SIZE"]:
-                logger.info(f"Última página alcançada (registros: {len(df_page)})")
                 break
             
             pagina += 1
-            time.sleep(1)  # Rate limiting entre páginas
+            time.sleep(1)
         
         if not all_data:
             logger.warning(f"Nenhum dado encontrado para código {codigo}")
             return None
         
-        # Consolidar todas as páginas
         df_final = pd.concat(all_data, ignore_index=True)
         logger.info(f"✓ Total de {len(df_final)} registros para código {codigo}")
         
         return df_final
         
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Erro HTTP ao buscar código {codigo}: {e}")
-        return None
     except Exception as e:
         logger.error(f"Erro ao processar código {codigo}: {e}")
         import traceback
@@ -312,9 +298,7 @@ def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
     """Converte tipos de dados"""
     try:
         if target_type == "STRING":
-            # Converter para string
             result = series.astype(str).replace(['nan', 'None', '<NA>', ''], None)
-            # Remover .0 final de números inteiros
             if result is not None and hasattr(result, 'str'):
                 result = result.str.replace(r'\.0+$', '', regex=True)
             return result
@@ -324,66 +308,74 @@ def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
             return pd.to_numeric(series, errors='coerce')
         elif target_type == "DATE":
             return pd.to_datetime(series, errors='coerce').dt.date
-        elif target_type == "TIMESTAMP":
-            return pd.to_datetime(series, errors='coerce', utc=True)
         else:
             return series
     except Exception as e:
         logger.warning(f"Erro ao converter coluna: {e}")
         return series
 
-def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza nomes de colunas para minúsculas"""
-    df.columns = df.columns.str.lower().str.strip()
-    return df
-
 def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     """Mapeia colunas do CSV para o schema do banco"""
     if df.empty:
         return pd.DataFrame(columns=list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script'])
     
-    # Normalizar nomes de colunas
-    df = normalize_column_names(df)
+    logger.info(f"Registros no CSV original: {len(df)}")
+    logger.info(f"Colunas originais: {df.columns.tolist()[:5]}...")
     
-    # Mapeamento explícito CSV → Banco
-    mapping = {
-        'idcompra': 'idcompra',
-        'numeroitemcompra': 'numeroitemcompra',
-        'codigoitemcatalogo': 'coditemcatalogo',
-        'codigouasg': 'unidadeorgaocodigounidade',
-        'nomeuasg': 'unidadeorgaonomeunidade',
+    # NORMALIZAÇÃO ROBUSTA (do código antigo)
+    df.columns = [normalizar_nome_coluna(col) for col in df.columns]
+    
+    # Tratar NaN/None (do código antigo)
+    df = df.where(pd.notna(df), None)
+    
+    logger.info(f"Colunas normalizadas: {df.columns.tolist()[:5]}...")
+    
+    # Mapeamento: CSV normalizado → Banco
+    column_mapping = {
+        'id_compra': 'idcompra',
+        'numero_item_compra': 'numeroitemcompra',
+        'codigo_item_catalogo': 'coditemcatalogo',
+        'codigo_uasg': 'unidadeorgaocodigounidade',
+        'nome_uasg': 'unidadeorgaonomeunidade',
         'estado': 'unidadeorgaouf',
-        'descricaoitem': 'descricaodetalhada',
+        'descricao_item': 'descricaodetalhada',
         'quantidade': 'quantidadehomologada',
-        'siglaunidademedida': 'unidademedida',
-        'precounitario': 'valorunitariohomologado',
-        'percentualmaiordesconto': 'percentualdesconto',
+        'sigla_unidade_medida': 'unidademedida',
+        'preco_unitario': 'valorunitariohomologado',
+        'percentual_maior_desconto': 'percentualdesconto',
         'marca': 'marca',
-        'nifornecedor': 'nifornecedor',
-        'nomefornecedor': 'nomefornecedor',
-        'datacompra': 'datacompra',
+        'ni_fornecedor': 'nifornecedor',
+        'nome_fornecedor': 'nomefornecedor',
+        'data_compra': 'datacompra',
     }
     
-    result_df = pd.DataFrame()
+    # Construir dicionário de dados (MANTÉM LINHAS)
+    result_data = {}
     
-    # Mapear colunas
-    for csv_col, schema_col in mapping.items():
+    for csv_col, schema_col in column_mapping.items():
         if csv_col in df.columns:
-            result_df[schema_col] = convert_column_type(df[csv_col], PRECOS_SCHEMA.get(schema_col, "STRING"))
+            result_data[schema_col] = convert_column_type(
+                df[csv_col],
+                PRECOS_SCHEMA.get(schema_col, "STRING")
+            )
+            logger.debug(f"✓ Mapeado: {csv_col} → {schema_col}")
         else:
-            result_df[schema_col] = None
-            logger.debug(f"Coluna {csv_col} não encontrada no CSV")
+            result_data[schema_col] = [None] * len(df)  # ← Preencher com None mas manter número de linhas
+            logger.warning(f"❌ Coluna '{csv_col}' não encontrada")
     
-    # Adicionar colunas que não estão no CSV mas são do schema
+    # Adicionar colunas faltantes do schema
     for col in PRECOS_SCHEMA.keys():
-        if col not in result_df.columns:
-            result_df[col] = None
+        if col not in result_data:
+            result_data[col] = [None] * len(df)
+    
+    # Criar DataFrame do dicionário (preserva linhas)
+    result_df = pd.DataFrame(result_data)
     
     # Adicionar metadados
     result_df['data_extracao'] = datetime.utcnow()
     result_df['versao_script'] = CONFIG["SCRIPT_VERSION"]
     
-    logger.info(f"✓ Mapeado {len(result_df)} registros do CSV para o schema")
+    logger.info(f"✓ DataFrame final: {len(result_df)} registros, {len(result_df.columns)} colunas")
     
     return result_df
 
@@ -405,7 +397,6 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
         placeholders = ', '.join(['%s'] * len(columns))
         columns_str = ', '.join(columns)
         
-        # PRIMARY KEY composta: (idcompra, numeroitemcompra)
         insert_query = f"""
             INSERT INTO precos_catalogo ({columns_str})
             VALUES ({placeholders})
@@ -415,10 +406,8 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
                 versao_script = EXCLUDED.versao_script
         """
         
-        # Preparar dados
         data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
         
-        # Executar batch insert
         execute_batch(cursor, insert_query, data_tuples, page_size=1000)
         
         conn.commit()
@@ -446,17 +435,14 @@ def process_single_code(codigo: str, tipo: str) -> bool:
     try:
         logger.info(f"--- Processando código: {codigo} ({tipo}) ---")
         
-        # Buscar dados da API
         df_raw = fetch_all_pages(codigo, tipo)
         
         if df_raw is None or df_raw.empty:
             logger.warning(f"Sem dados para código {codigo}")
             return False
         
-        # Transformar dados
         df_clean = map_csv_to_schema(df_raw)
         
-        # Carregar no banco
         success = load_precos_to_cockroach(df_clean)
         
         return success
@@ -474,24 +460,21 @@ def process_single_code(codigo: str, tipo: str) -> bool:
 def main():
     """Orquestração principal do pipeline de preços"""
     
-    # Mostrar modo de execução
     if CONFIG["MODO_TESTE"]:
         logger.info("="*60)
         logger.info("⚠️  EXECUTANDO EM MODO TESTE ⚠️")
-        logger.info(f"Códigos a processar: {CONFIG['TESTE_CODIGOS']}")
+        logger.info(f"Códigos: {CONFIG['TESTE_CODIGOS']}")
         logger.info("="*60)
     else:
-        logger.info("=== Iniciando Pipeline de Preços de Catálogo (MODO PRODUÇÃO) ===")
+        logger.info("=== Pipeline de Preços de Catálogo (PRODUÇÃO) ===")
     
     try:
-        # 1. Buscar códigos pendentes
         pending_codes = get_pending_codes()
         
         if not pending_codes:
-            logger.info("Nenhum código pendente para processar")
+            logger.info("Nenhum código pendente")
             return
         
-        # 2. Processar em batches com controle de falhas consecutivas
         total = len(pending_codes)
         processed = 0
         failed = 0
@@ -500,18 +483,12 @@ def main():
         for i in range(0, len(pending_codes), CONFIG["BATCH_SIZE"]):
             batch = pending_codes[i:i + CONFIG["BATCH_SIZE"]]
             
-            logger.info(f"\n>>> Processando lote {i//CONFIG['BATCH_SIZE'] + 1} ({len(batch)} códigos)")
+            logger.info(f"\n>>> Lote {i//CONFIG['BATCH_SIZE'] + 1} ({len(batch)} códigos)")
             logger.info(f"Falhas consecutivas: {consecutive_failures}/{CONFIG['MAX_CONSECUTIVE_FAILURES']}")
             
             for codigo, tipo in batch:
-                # Verificar limite de falhas consecutivas
                 if consecutive_failures >= CONFIG["MAX_CONSECUTIVE_FAILURES"]:
-                    logger.critical(f"🛑 LIMITE DE FALHAS CONSECUTIVAS ATINGIDO ({CONFIG['MAX_CONSECUTIVE_FAILURES']})")
-                    logger.critical("Parando execução para evitar bloqueio de IP")
-                    logger.info(f"\nResumo até parada:")
-                    logger.info(f"  - Processados: {processed}/{total}")
-                    logger.info(f"  - Falhas: {failed}")
-                    logger.info(f"  - Restantes: {total - processed - failed}")
+                    logger.critical(f"🛑 LIMITE ATINGIDO ({CONFIG['MAX_CONSECUTIVE_FAILURES']})")
                     return
                 
                 retry_count = 0
@@ -519,7 +496,6 @@ def main():
                 
                 while retry_count < CONFIG["MAX_RETRIES_PER_ITEM"] and not success:
                     if retry_count > 0:
-                        logger.info(f"Tentativa {retry_count + 1} para código {codigo}")
                         time.sleep(CONFIG["RETRY_DELAY_SECONDS"])
                     
                     success = process_single_code(codigo, tipo)
@@ -528,25 +504,19 @@ def main():
                 if success:
                     processed += 1
                     consecutive_failures = 0
-                    logger.info(f"✅ Sucesso | Falhas consecutivas resetadas para 0")
+                    logger.info(f"✅ Sucesso")
                     time.sleep(CONFIG["SUCCESS_DELAY_SECONDS"])
                 else:
                     failed += 1
                     consecutive_failures += 1
-                    logger.error(f"❌ Código {codigo} falhou após {CONFIG['MAX_RETRIES_PER_ITEM']} tentativas")
-                    logger.warning(f"⚠️  Falhas consecutivas: {consecutive_failures}/{CONFIG['MAX_CONSECUTIVE_FAILURES']}")
+                    logger.error(f"❌ Falhou após {CONFIG['MAX_RETRIES_PER_ITEM']} tentativas")
             
+            logger.info(f"Progresso: {processed}/{total}")
         
-        # 3. Relatório final
-        modo = "TESTE" if CONFIG["MODO_TESTE"] else "PRODUÇÃO"
-        logger.info(f"\n=== Pipeline Concluído (MODO {modo}) ===")
-        logger.info(f"Total: {total} códigos")
-        logger.info(f"Sucesso: {processed}")
-        logger.info(f"Falhas: {failed}")
-        logger.info(f"Taxa de sucesso: {(processed/total)*100:.2f}%")
+        logger.info("\n=== CONCLUÍDO ===")
         
     except Exception as e:
-        logger.error(f"Erro no pipeline principal: {e}")
+        logger.error(f"Erro fatal: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise
