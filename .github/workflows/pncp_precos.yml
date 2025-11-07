@@ -1,4 +1,4 @@
-name: Preços Catálogo Pipeline
+name: PNCP Preços
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ jobs:
         env:
           COCKROACH_CONNECTION_STRING: ${{ secrets.COCKROACH_CONNECTION_STRING }}
         run: |
-          python get_precos_catalogo.py
+          python get_precos.py
       
       - name: Upload Logs (on failure)
         if: failure()
