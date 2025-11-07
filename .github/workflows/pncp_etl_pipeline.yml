@@ -2,8 +2,6 @@ name: PNCP Pipeline
 
 on:
   workflow_dispatch:
-
-  # Schedule
   schedule:
     - cron: '0 9,15 * * *'
 
@@ -11,14 +9,24 @@ jobs:
   run-etl:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Usando uma versão moderna e estável do Python.
+          python-version: '3.11'
 
       - name: Install Python dependencies
         run: |
@@ -26,6 +34,4 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run ETL Script
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python main.py
