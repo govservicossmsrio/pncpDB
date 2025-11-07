@@ -81,7 +81,7 @@ ITENS_SCHEMA = {
     "numerogrupo": "INTEGER",
     "materialouserviconome": "STRING",
     "tipobeneficionome": "STRING",
-    "coditemcatalogo": "STRING",
+    "codigoitemcatalogo": "STRING",  # PADRONIZADO
     "descricaoresumida": "STRING",
     "descricaodetalhada": "STRING",
     "quantidade": "FLOAT",
@@ -187,6 +187,11 @@ def map_and_clean_dataframe(df: pd.DataFrame, schema: Dict[str, str]) -> pd.Data
     
     # Normalizar nomes de colunas
     df = normalize_column_names(df)
+    
+    # MAPEAMENTO ESPECIAL: coditemcatalogo → codigoitemcatalogo
+    if 'coditemcatalogo' in df.columns and 'codigoitemcatalogo' not in df.columns:
+        df['codigoitemcatalogo'] = df['coditemcatalogo']
+        logger.debug("Mapeado: coditemcatalogo → codigoitemcatalogo")
     
     result_df = pd.DataFrame()
     
