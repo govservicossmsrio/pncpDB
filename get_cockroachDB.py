@@ -81,7 +81,7 @@ ITENS_SCHEMA = {
     "numerogrupo": "INTEGER",
     "materialouserviconome": "STRING",
     "tipobeneficionome": "STRING",
-    "codigoitemcatalogo": "STRING",  # PADRONIZADO
+    "coditemcatalogo": "STRING",  # Nome original da API
     "descricaoresumida": "STRING",
     "descricaodetalhada": "STRING",
     "quantidade": "FLOAT",
@@ -160,7 +160,12 @@ def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
     """Converte tipos de dados"""
     try:
         if target_type == "STRING":
-            return series.astype(str).replace(['nan', 'None', '<NA>', ''], None)
+            # Converter para string
+            result = series.astype(str).replace(['nan', 'None', '<NA>', ''], None)
+            # Remover .0 final de números inteiros (ex: "27589.0" → "27589")
+            if result is not None and hasattr(result, 'str'):
+                result = result.str.replace(r'\.0$', '', regex=True)
+            return result
         elif target_type == "INTEGER":
             return pd.to_numeric(series, errors='coerce').astype('Int64')
         elif target_type == "FLOAT":
@@ -187,11 +192,6 @@ def map_and_clean_dataframe(df: pd.DataFrame, schema: Dict[str, str]) -> pd.Data
     
     # Normalizar nomes de colunas
     df = normalize_column_names(df)
-    
-    # MAPEAMENTO ESPECIAL: coditemcatalogo → codigoitemcatalogo
-    if 'coditemcatalogo' in df.columns and 'codigoitemcatalogo' not in df.columns:
-        df['codigoitemcatalogo'] = df['coditemcatalogo']
-        logger.debug("Mapeado: coditemcatalogo → codigoitemcatalogo")
     
     result_df = pd.DataFrame()
     
