@@ -139,14 +139,14 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         """)
         
         result_precos = cursor.fetchone()
-        col_precos = result_precos[0] if result_precos else col_itens
+        col_precos = result_precos[0] if result_precos else 'codigoitemcatalogo'
         logger.info(f"Usando coluna em precos_catalogo: {col_precos}")
         
-        # Query dinâmica usando os nomes corretos
+        # Query com limpeza do .0 e .00
         query = f"""
         WITH codigos_itens AS (
             SELECT DISTINCT 
-                {col_itens} as codigo,
+                TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_itens}, '\.0+$', ''))) as codigo,
                 LOWER(materialouserviconome) as tipo_lower
             FROM itens_compra
             WHERE {col_itens} IS NOT NULL 
@@ -155,10 +155,10 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         ),
         codigos_processados AS (
             SELECT DISTINCT 
-                {col_precos} as codigo,
+                TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_precos}, '\.0+$', ''))) as codigo,
                 MAX(data_extracao) as ultima_extracao
             FROM precos_catalogo
-            GROUP BY {col_precos}
+            GROUP BY TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_precos}, '\.0+$', '')))
         )
         SELECT 
             ci.codigo,
@@ -169,10 +169,11 @@ def get_pending_codes() -> List[Tuple[str, str]]:
             END as tipo
         FROM codigos_itens ci
         LEFT JOIN codigos_processados cp ON ci.codigo = cp.codigo
+        WHERE ci.codigo ~ '^[0-9]+$'
         ORDER BY 
             CASE WHEN cp.codigo IS NULL THEN 0 ELSE 1 END,
             cp.ultima_extracao ASC NULLS FIRST,
-            ci.codigo
+            ci.codigo::INT
         """
         
         cursor.execute(query)
@@ -283,7 +284,12 @@ def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
     """Converte tipos de dados"""
     try:
         if target_type == "STRING":
-            return series.astype(str).replace(['nan', 'None', '<NA>', ''], None)
+            # Converter para string
+            result = series.astype(str).replace(['nan', 'None', '<NA>', ''], None)
+            # Remover .0 final de números inteiros
+            if result is not None and hasattr(result, 'str'):
+                result = result.str.replace(r'\.0+$', '', regex=True)
+            return result
         elif target_type == "INTEGER":
             return pd.to_numeric(series, errors='coerce').astype('Int64')
         elif target_type == "FLOAT":
