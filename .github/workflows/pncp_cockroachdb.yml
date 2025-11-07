@@ -1,4 +1,4 @@
-name: PNCP Pipeline
+name: PNCP to CockroachDB
 
 on:
   workflow_dispatch:
