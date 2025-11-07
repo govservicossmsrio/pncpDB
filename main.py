@@ -61,11 +61,11 @@ def load_data_to_bigquery(df, table_name):
 def process_single_id(pncp_id):
     try:
         contratacoes_data = get_pncp_data("CONTRATACOES", pncp_id)
-        if not contratacoes_data or not contratacoes_data.get('data'):
+        if not contratacoes_data or not contratacoes_data.get('resultado'):
             logging.warning(f"Nenhum dado de contratação encontrado para ID {pncp_id}. Pulando.")
             return
 
-        contratacoes_list = contratacoes_data.get('data', [])
+        contratacoes_list = contratacoes_data.get('resultado', [])
         itens_data = get_pncp_data("ITENS", pncp_id)
         resultados_data = get_pncp_data("RESULTADOS", pncp_id)
 
@@ -74,13 +74,13 @@ def process_single_id(pncp_id):
             logging.info(f"Processando {len(df)} registro(s) para a tabela 'compras'.")
             load_data_to_bigquery(df, 'compras')
 
-        if itens_data and itens_data.get('data'):
-            df = pd.json_normalize(itens_data.get('data', []))
+        if itens_data and itens_data.get('resultado'):
+            df = pd.json_normalize(itens_data.get('resultado', []))
             logging.info(f"Processando {len(df)} registro(s) para a tabela 'itens_compra'.")
             load_data_to_bigquery(df, 'itens_compra')
 
-        if resultados_data and resultados_data.get('data'):
-            df = pd.json_normalize(resultados_data.get('data', []))
+        if resultados_data and resultados_data.get('resultado'):
+            df = pd.json_normalize(resultados_data.get('resultado', []))
             logging.info(f"Processando {len(df)} registro(s) para a tabela 'resultados_itens'.")
             load_data_to_bigquery(df, 'resultados_itens')
 
