@@ -1,4 +1,4 @@
-name: PNCP Data ETL Pipeline
+name: PNCP Pipeline
 
 on:
   workflow_dispatch:
@@ -17,17 +17,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # CORREÇÃO: Adicionando os escopos necessários.
+      # Esta etapa configura a autenticação no ambiente.
+      # A seção 'scopes' foi REMOVIDA pois estava incorreta e causava o erro.
       - name: Authenticate to Google Cloud
         id: auth
         uses: 'google-github-actions/auth@v2'
         with:
           credentials_json: '${{ secrets.GCP_SA_KEY }}'
-          # Esta seção solicita as permissões para o token de acesso.
-          scopes: |-
-            https://www.googleapis.com/auth/cloud-platform
-            https://www.googleapis.com/auth/drive
-            https://www.googleapis.com/auth/spreadsheets
 
       - name: Set up Python
         uses: actions/setup-python@v5
