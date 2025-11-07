@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO,
 
 # --- CONFIGURAÇÃO CENTRALIZADA ---
 CONFIG = {
-    "GCP_PROJECT_ID": "pncpdb", 
+    "GCP_PROJECT_ID": "inbound-fulcrum-476517-s6", 
     "BIGQUERY_DATASET": "pncp_data",
     "SPREADSHEET_ID": "18P9l9_g-QE-DWsfRCokY18M5RLZe7mV-CWY1bfw6hlA",
     "SHEET_NAME": "idLista",
