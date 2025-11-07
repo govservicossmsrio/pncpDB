@@ -8,8 +8,6 @@ from google.cloud import bigquery
 from google.api_core import exceptions
 import gspread
 import google.auth
-import pandas_gbq
-import numpy as np
 
 # --- CONFIGURAÇÃO DE LOG ---
 logging.basicConfig(level=logging.INFO,
@@ -34,7 +32,7 @@ CONFIG = {
     "RETRY_DELAYS_SECONDS": {3: 5, 6: 10, 9: 60, 12: 300, 15: 600, 18: "CANCEL"}
 }
 
-# Mapeamento de campos da API para o schema da tabela 'compras'
+# Mapeamento de campos
 COMPRAS_FIELD_MAPPING = {
     'idCompra': 'idCompra',
     'numeroCompra': 'numeroCompra',
@@ -96,6 +94,9 @@ RESULTADOS_FIELD_MAPPING = {
     'paisOrigemProdutoServicoId': 'paisOrigemProdutoServicoId'
 }
 
+# Cliente BigQuery global (será inicializado no main)
+BQ_CLIENT = None
+
 def get_pncp_data(endpoint_key, id_param):
     url = f"{CONFIG['PNCP_BASE_URL']}/{CONFIG['ENDPOINTS'][endpoint_key]}"
     params = {'tipo': 'idCompra', 'codigo': id_param}
@@ -113,26 +114,8 @@ def get_pncp_data(endpoint_key, id_param):
         logging.error(f"Erro inesperado na chamada da API para ID {id_param}: {e}")
         raise
 
-def sanitize_value(value):
-    """
-    Sanitiza um valor individual para garantir compatibilidade com Parquet.
-    """
-    if pd.isna(value) or value is None:
-        return None
-    if isinstance(value, (list, dict)):
-        return str(value)
-    if isinstance(value, (np.integer, np.floating)):
-        return value.item()
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value
-    return str(value)
-
 def map_and_clean_dataframe(df, field_mapping):
-    """
-    Mapeia e limpa rigorosamente o DataFrame para BigQuery/Parquet.
-    """
+    """Mapeia campos e converte para strings todos os valores para máxima compatibilidade."""
     if df.empty:
         return df
     
@@ -140,9 +123,12 @@ def map_and_clean_dataframe(df, field_mapping):
     df_mapped = df[list(available_fields.keys())].copy()
     df_mapped = df_mapped.rename(columns=available_fields)
     
-    # Aplicar sanitização em todas as colunas
+    # Converte TUDO para string - máxima compatibilidade
+    # O BigQuery fará a conversão para os tipos corretos do schema automaticamente
     for col in df_mapped.columns:
-        df_mapped[col] = df_mapped[col].apply(sanitize_value)
+        df_mapped[col] = df_mapped[col].astype(str)
+        # Substitui 'nan', 'None', '<NA>' por None real
+        df_mapped[col] = df_mapped[col].replace(['nan', 'None', '<NA>', 'NaN'], None)
     
     # Adiciona timestamp de extração
     if 'data_extracao' in field_mapping.values() and 'data_extracao' not in df_mapped.columns:
@@ -151,6 +137,7 @@ def map_and_clean_dataframe(df, field_mapping):
     return df_mapped
 
 def load_data_to_bigquery(df, table_name, field_mapping):
+    """Carrega dados usando o cliente nativo do BigQuery (método mais confiável)."""
     if df.empty: 
         logging.info(f"DataFrame vazio para '{table_name}', nada a carregar.")
         return
@@ -162,29 +149,26 @@ def load_data_to_bigquery(df, table_name, field_mapping):
         
         logging.info(f"Carregando {len(df_clean)} registro(s) com {len(df_clean.columns)} campos na tabela '{table_name}'...")
         
-        # Tenta converter para Parquet antes de enviar (para diagnóstico)
-        try:
-            df_clean.to_parquet('/tmp/test.parquet', engine='pyarrow')
-            logging.info("Conversão para Parquet bem-sucedida localmente.")
-        except Exception as parquet_err:
-            logging.error(f"DIAGNÓSTICO: Falha na conversão local para Parquet: {parquet_err}")
-            # Log detalhado de cada coluna
-            for col in df_clean.columns:
-                sample_value = df_clean[col].iloc[0] if not df_clean[col].empty else None
-                logging.error(f"  Coluna '{col}': tipo={type(sample_value)}, valor_amostra={sample_value}")
-            raise
-        
-        pandas_gbq.to_gbq(
-            df_clean,
-            destination_table=table_id,
-            project_id=CONFIG["GCP_PROJECT_ID"],
-            if_exists='append',
-            progress_bar=False
+        # SOLUÇÃO DEFINITIVA: Usar cliente BigQuery nativo
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            autodetect=False  # Usa o schema existente da tabela
         )
         
-        logging.info(f"{len(df_clean)} registro(s) carregado(s) com sucesso na tabela '{table_name}'.")
+        job = BQ_CLIENT.load_table_from_dataframe(
+            df_clean,
+            table_id,
+            job_config=job_config
+        )
+        
+        # Aguarda conclusão do job
+        job.result()
+        
+        logging.info(f"✓ {len(df_clean)} registro(s) carregado(s) com sucesso na tabela '{table_name}'.")
     except Exception as e:
         logging.error(f"Falha ao carregar dados na tabela '{table_name}': {e}")
+        if hasattr(e, 'errors'):
+            logging.error(f"Erros detalhados do BigQuery: {e.errors}")
         raise
 
 def process_single_id(pncp_id):
@@ -218,6 +202,8 @@ def process_single_id(pncp_id):
         raise e
 
 def main():
+    global BQ_CLIENT
+    
     logging.info("--- INICIANDO PIPELINE DE ETL DO PNCP ---")
     
     try:
@@ -228,7 +214,7 @@ def main():
         ])
         
         gc = gspread.authorize(scoped_creds)
-        bq_client = bigquery.Client(credentials=creds, project=project_id or CONFIG["GCP_PROJECT_ID"])
+        BQ_CLIENT = bigquery.Client(credentials=creds, project=project_id or CONFIG["GCP_PROJECT_ID"])
 
         logging.info("Lendo IDs da planilha Google Sheets...")
         sheet = gc.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["SHEET_NAME"])
@@ -239,7 +225,7 @@ def main():
         query = f"SELECT DISTINCT CAST(idCompra AS STRING) as idCompra FROM `{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.compras`"
         existing_ids = set()
         try:
-            df_existing = bq_client.query(query).to_dataframe()
+            df_existing = BQ_CLIENT.query(query).to_dataframe()
             if not df_existing.empty:
                 existing_ids = set(df_existing['idCompra'])
         except exceptions.NotFound:
