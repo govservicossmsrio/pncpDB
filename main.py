@@ -71,8 +71,8 @@ def process_single_id(pncp_id):
 
         if contratacoes_list:
             df = pd.json_normalize(contratacoes_list)
-            logging.info(f"Processando {len(df)} registro(s) para a tabela 'contratacoes'.")
-            load_data_to_bigquery(df, 'contratacoes')
+            logging.info(f"Processando {len(df)} registro(s) para a tabela 'compras'.")
+            load_data_to_bigquery(df, 'compras')
 
         if itens_data and itens_data.get('data'):
             df = pd.json_normalize(itens_data.get('data', []))
@@ -113,14 +113,14 @@ def main():
         ids_from_sheet = [row[0] for row in all_rows[1:] if row and row[0].strip()]
         logging.info(f"Encontrados {len(ids_from_sheet)} IDs na planilha.")
 
-        query = f"SELECT DISTINCT CAST(idCompra AS STRING) as idCompra FROM `{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.contratacoes`"
+        query = f"SELECT DISTINCT CAST(idCompra AS STRING) as idCompra FROM `{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.compras`"
         existing_ids = set()
         try:
             df_existing = bq_client.query(query).to_dataframe()
             if not df_existing.empty:
                 existing_ids = set(df_existing['idCompra'])
         except exceptions.NotFound:
-            logging.warning("Tabela 'contratacoes' não encontrada. Assumindo primeira execução.")
+            logging.warning("Tabela 'compras' não encontrada. Assumindo primeira execução.")
         
         ids_to_process = [id_val for id_val in ids_from_sheet if id_val not in existing_ids]
         logging.info(f"Após filtragem, {len(ids_to_process)} IDs a serem processados.")
