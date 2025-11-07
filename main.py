@@ -9,6 +9,7 @@ from google.api_core import exceptions
 import gspread
 import google.auth
 import pandas_gbq
+import numpy as np
 
 # --- CONFIGURAÇÃO DE LOG ---
 logging.basicConfig(level=logging.INFO,
@@ -55,7 +56,6 @@ COMPRAS_FIELD_MAPPING = {
     'contratacaoExcluida': 'contratacaoExcluida'
 }
 
-# Mapeamento para 'itens_compra'
 ITENS_FIELD_MAPPING = {
     'idCompraItem': 'idCompraItem',
     'idCompra': 'idCompra',
@@ -76,7 +76,6 @@ ITENS_FIELD_MAPPING = {
     'nomeFornecedor': 'nomeFornecedor'
 }
 
-# Mapeamento para 'resultados_itens'
 RESULTADOS_FIELD_MAPPING = {
     'idCompraItem': 'idCompraItem',
     'idCompra': 'idCompra',
@@ -114,32 +113,40 @@ def get_pncp_data(endpoint_key, id_param):
         logging.error(f"Erro inesperado na chamada da API para ID {id_param}: {e}")
         raise
 
+def sanitize_value(value):
+    """
+    Sanitiza um valor individual para garantir compatibilidade com Parquet.
+    """
+    if pd.isna(value) or value is None:
+        return None
+    if isinstance(value, (list, dict)):
+        return str(value)
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    return str(value)
+
 def map_and_clean_dataframe(df, field_mapping):
     """
-    Mapeia e limpa o DataFrame para corresponder ao schema da tabela do BigQuery.
-    Mantém apenas os campos definidos no mapeamento.
+    Mapeia e limpa rigorosamente o DataFrame para BigQuery/Parquet.
     """
     if df.empty:
         return df
     
-    # Seleciona apenas os campos que existem no mapeamento E no DataFrame
     available_fields = {api_field: bq_field for api_field, bq_field in field_mapping.items() if api_field in df.columns}
-    
-    # Cria um novo DataFrame apenas com os campos mapeados
     df_mapped = df[list(available_fields.keys())].copy()
-    
-    # Renomeia as colunas conforme o mapeamento (se necessário)
     df_mapped = df_mapped.rename(columns=available_fields)
     
-    # Adiciona timestamp de extração se não existir
-    if 'data_extracao' in field_mapping.values() and 'data_extracao' not in df_mapped.columns:
-        df_mapped['data_extracao'] = datetime.utcnow()
+    # Aplicar sanitização em todas as colunas
+    for col in df_mapped.columns:
+        df_mapped[col] = df_mapped[col].apply(sanitize_value)
     
-    # Converte colunas de data para string (para evitar problemas com timezone)
-    date_columns = [col for col in df_mapped.columns if 'data' in col.lower() or 'date' in col.lower()]
-    for col in date_columns:
-        if col in df_mapped.columns:
-            df_mapped[col] = df_mapped[col].astype(str)
+    # Adiciona timestamp de extração
+    if 'data_extracao' in field_mapping.values() and 'data_extracao' not in df_mapped.columns:
+        df_mapped['data_extracao'] = datetime.utcnow().isoformat()
     
     return df_mapped
 
@@ -151,10 +158,21 @@ def load_data_to_bigquery(df, table_name, field_mapping):
     table_id = f"{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.{table_name}"
     
     try:
-        # Mapeia e limpa o DataFrame
         df_clean = map_and_clean_dataframe(df, field_mapping)
         
         logging.info(f"Carregando {len(df_clean)} registro(s) com {len(df_clean.columns)} campos na tabela '{table_name}'...")
+        
+        # Tenta converter para Parquet antes de enviar (para diagnóstico)
+        try:
+            df_clean.to_parquet('/tmp/test.parquet', engine='pyarrow')
+            logging.info("Conversão para Parquet bem-sucedida localmente.")
+        except Exception as parquet_err:
+            logging.error(f"DIAGNÓSTICO: Falha na conversão local para Parquet: {parquet_err}")
+            # Log detalhado de cada coluna
+            for col in df_clean.columns:
+                sample_value = df_clean[col].iloc[0] if not df_clean[col].empty else None
+                logging.error(f"  Coluna '{col}': tipo={type(sample_value)}, valor_amostra={sample_value}")
+            raise
         
         pandas_gbq.to_gbq(
             df_clean,
@@ -167,7 +185,6 @@ def load_data_to_bigquery(df, table_name, field_mapping):
         logging.info(f"{len(df_clean)} registro(s) carregado(s) com sucesso na tabela '{table_name}'.")
     except Exception as e:
         logging.error(f"Falha ao carregar dados na tabela '{table_name}': {e}")
-        logging.error(f"Colunas no DataFrame limpo: {list(df_clean.columns) if 'df_clean' in locals() else 'N/A'}")
         raise
 
 def process_single_id(pncp_id):
