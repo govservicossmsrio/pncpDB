@@ -198,7 +198,7 @@ def map_and_clean_dataframe(df: pd.DataFrame, schema: Dict[str, str]) -> pd.Data
 # =====================================================
 
 def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, str]) -> bool:
-    """Carrega dados no CockroachDB"""
+    """Carrega dados no CockroachDB com case-sensitive column names"""
     if df.empty:
         logger.warning(f"DataFrame vazio para tabela {table_name}")
         return False
@@ -208,17 +208,23 @@ def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, 
         cursor = conn.cursor()
         
         columns = list(schema.keys()) + ['data_extracao']
+        
+        # Usar aspas duplas para preservar case-sensitivity
+        columns_quoted = [f'"{col}"' for col in columns]
         placeholders = ', '.join(['%s'] * len(columns))
-        columns_str = ', '.join(columns)
+        columns_str = ', '.join(columns_quoted)
         
         # Determina a coluna de conflito
-        conflict_column = "idCompraItem" if table_name != "compras" else "idCompra"
+        conflict_column = '"idCompraItem"' if table_name != "compras" else '"idCompra"'
+        
+        # Criar lista de SET clauses para UPDATE
+        set_clauses = ', '.join([f'"{col}" = EXCLUDED."{col}"' for col in columns])
         
         insert_query = f"""
             INSERT INTO {table_name} ({columns_str})
             VALUES ({placeholders})
             ON CONFLICT ({conflict_column})
-            DO UPDATE SET data_extracao = EXCLUDED.data_extracao
+            DO UPDATE SET {set_clauses}
         """
         
         data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
@@ -236,6 +242,7 @@ def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, 
         logger.error(f"Erro ao inserir em {table_name}: {e}")
         if 'conn' in locals():
             conn.rollback()
+            conn.close()
         return False
 
 # =====================================================
