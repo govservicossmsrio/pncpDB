@@ -111,7 +111,7 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Primeiro, verificar qual coluna existe
+        # Verificar qual coluna existe em itens_compra
         cursor.execute("""
             SELECT column_name 
             FROM information_schema.columns 
@@ -119,34 +119,46 @@ def get_pending_codes() -> List[Tuple[str, str]]:
               AND column_name IN ('coditemcatalogo', 'codigoitemcatalogo')
         """)
         
-        result = cursor.fetchone()
+        result_itens = cursor.fetchone()
         
-        if not result:
+        if not result_itens:
             logger.error("Nenhuma coluna de código de catálogo encontrada em itens_compra")
             cursor.close()
             conn.close()
             return []
         
-        col_name = result[0]
-        logger.info(f"Usando coluna: {col_name}")
+        col_itens = result_itens[0]
+        logger.info(f"Usando coluna em itens_compra: {col_itens}")
         
-        # Query dinâmica usando o nome correto da coluna
+        # Verificar qual coluna existe em precos_catalogo
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'precos_catalogo' 
+              AND column_name IN ('coditemcatalogo', 'codigoitemcatalogo')
+        """)
+        
+        result_precos = cursor.fetchone()
+        col_precos = result_precos[0] if result_precos else col_itens
+        logger.info(f"Usando coluna em precos_catalogo: {col_precos}")
+        
+        # Query dinâmica usando os nomes corretos
         query = f"""
         WITH codigos_itens AS (
             SELECT DISTINCT 
-                {col_name} as codigo,
+                {col_itens} as codigo,
                 LOWER(materialouserviconome) as tipo_lower
             FROM itens_compra
-            WHERE {col_name} IS NOT NULL 
-              AND {col_name} != ''
+            WHERE {col_itens} IS NOT NULL 
+              AND {col_itens} != ''
               AND materialouserviconome IS NOT NULL
         ),
         codigos_processados AS (
             SELECT DISTINCT 
-                codigoitemcatalogo as codigo,
+                {col_precos} as codigo,
                 MAX(data_extracao) as ultima_extracao
             FROM precos_catalogo
-            GROUP BY codigoitemcatalogo
+            GROUP BY {col_precos}
         )
         SELECT 
             ci.codigo,
