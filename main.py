@@ -33,6 +33,70 @@ CONFIG = {
     "RETRY_DELAYS_SECONDS": {3: 5, 6: 10, 9: 60, 12: 300, 15: 600, 18: "CANCEL"}
 }
 
+# Mapeamento de campos da API para o schema da tabela 'compras'
+COMPRAS_FIELD_MAPPING = {
+    'idCompra': 'idCompra',
+    'numeroCompra': 'numeroCompra',
+    'anoCompraPncp': 'anoCompraPncp',
+    'codigoModalidade': 'codigoModalidade',
+    'modalidadeNome': 'modalidadeNome',
+    'srp': 'srp',
+    'unidadeOrgaoCodigoUnidade': 'unidadeOrgaoCodigoUnidade',
+    'unidadeOrgaoNomeUnidade': 'unidadeOrgaoNomeUnidade',
+    'unidadeOrgaoMunicipioNome': 'unidadeOrgaoMunicipioNome',
+    'unidadeOrgaoUfSigla': 'unidadeOrgaoUfSigla',
+    'orgaoEntidadeEsferaId': 'orgaoEntidadeEsferaId',
+    'processo': 'processo',
+    'objetoCompra': 'objetoCompra',
+    'valorTotalEstimado': 'valorTotalEstimado',
+    'valorTotalHomologado': 'valorTotalHomologado',
+    'existeResultado': 'existeResultado',
+    'dataAberturaPropostaPncp': 'dataAberturaPropostaPncp',
+    'contratacaoExcluida': 'contratacaoExcluida'
+}
+
+# Mapeamento para 'itens_compra'
+ITENS_FIELD_MAPPING = {
+    'idCompraItem': 'idCompraItem',
+    'idCompra': 'idCompra',
+    'numeroItemCompra': 'numeroItemCompra',
+    'numeroGrupo': 'numeroGrupo',
+    'materialOuServicoNome': 'materialOuServicoNome',
+    'tipoBeneficioNome': 'tipoBeneficioNome',
+    'codItemCatalogo': 'codItemCatalogo',
+    'descricaoResumida': 'descricaoResumida',
+    'descricaodetalhada': 'descricaodetalhada',
+    'quantidade': 'quantidade',
+    'unidadeMedida': 'unidadeMedida',
+    'valorUnitarioEstimado': 'valorUnitarioEstimado',
+    'valorTotal': 'valorTotal',
+    'temResultado': 'temResultado',
+    'situacaoCompraItemNome': 'situacaoCompraItemNome',
+    'cnpjFornecedor': 'cnpjFornecedor',
+    'nomeFornecedor': 'nomeFornecedor'
+}
+
+# Mapeamento para 'resultados_itens'
+RESULTADOS_FIELD_MAPPING = {
+    'idCompraItem': 'idCompraItem',
+    'idCompra': 'idCompra',
+    'niFornecedor': 'niFornecedor',
+    'tipoPessoa': 'tipoPessoa',
+    'nomeRazaoSocialFornecedor': 'nomeRazaoSocialFornecedor',
+    'naturezaJuridicaNome': 'naturezaJuridicaNome',
+    'porteFornecedorNome': 'porteFornecedorNome',
+    'quantidadeHomologada': 'quantidadeHomologada',
+    'valorUnitarioHomologado': 'valorUnitarioHomologado',
+    'valorTotalHomologado': 'valorTotalHomologado',
+    'percentualDesconto': 'percentualDesconto',
+    'dataResultadoPncp': 'dataResultadoPncp',
+    'aplicacaoBeneficioMeepp': 'aplicacaoBeneficioMeepp',
+    'moedaEstrangeiraId': 'moedaEstrangeiraId',
+    'dataCotacaoMoedaEstrangeira': 'dataCotacaoMoedaEstrangeira',
+    'valorNominalMoedaEstrangeira': 'valorNominalMoedaEstrangeira',
+    'paisOrigemProdutoServicoId': 'paisOrigemProdutoServicoId'
+}
+
 def get_pncp_data(endpoint_key, id_param):
     url = f"{CONFIG['PNCP_BASE_URL']}/{CONFIG['ENDPOINTS'][endpoint_key]}"
     params = {'tipo': 'idCompra', 'codigo': id_param}
@@ -50,37 +114,36 @@ def get_pncp_data(endpoint_key, id_param):
         logging.error(f"Erro inesperado na chamada da API para ID {id_param}: {e}")
         raise
 
-def clean_dataframe_for_bigquery(df):
+def map_and_clean_dataframe(df, field_mapping):
     """
-    Limpa e normaliza o DataFrame para garantir compatibilidade com BigQuery/Parquet.
-    - Converte colunas de objetos aninhados (listas/dicts) em strings JSON
-    - Converte tipos de dados problemáticos
-    - Remove colunas completamente vazias
+    Mapeia e limpa o DataFrame para corresponder ao schema da tabela do BigQuery.
+    Mantém apenas os campos definidos no mapeamento.
     """
     if df.empty:
         return df
     
-    df_clean = df.copy()
+    # Seleciona apenas os campos que existem no mapeamento E no DataFrame
+    available_fields = {api_field: bq_field for api_field, bq_field in field_mapping.items() if api_field in df.columns}
     
-    for col in df_clean.columns:
-        # Se a coluna contém listas ou dicionários, converte para string JSON
-        if df_clean[col].dtype == 'object':
-            try:
-                # Verifica se há estruturas complexas na coluna
-                sample = df_clean[col].dropna().iloc[0] if not df_clean[col].dropna().empty else None
-                if isinstance(sample, (list, dict)):
-                    df_clean[col] = df_clean[col].apply(lambda x: str(x) if pd.notna(x) else None)
-                    logging.info(f"Coluna '{col}' convertida de objeto complexo para string.")
-            except Exception as e:
-                logging.warning(f"Erro ao processar coluna '{col}': {e}. Convertendo para string.")
-                df_clean[col] = df_clean[col].astype(str)
+    # Cria um novo DataFrame apenas com os campos mapeados
+    df_mapped = df[list(available_fields.keys())].copy()
     
-    # Remove colunas completamente vazias
-    df_clean = df_clean.dropna(axis=1, how='all')
+    # Renomeia as colunas conforme o mapeamento (se necessário)
+    df_mapped = df_mapped.rename(columns=available_fields)
     
-    return df_clean
+    # Adiciona timestamp de extração se não existir
+    if 'data_extracao' in field_mapping.values() and 'data_extracao' not in df_mapped.columns:
+        df_mapped['data_extracao'] = datetime.utcnow()
+    
+    # Converte colunas de data para string (para evitar problemas com timezone)
+    date_columns = [col for col in df_mapped.columns if 'data' in col.lower() or 'date' in col.lower()]
+    for col in date_columns:
+        if col in df_mapped.columns:
+            df_mapped[col] = df_mapped[col].astype(str)
+    
+    return df_mapped
 
-def load_data_to_bigquery(df, table_name):
+def load_data_to_bigquery(df, table_name, field_mapping):
     if df.empty: 
         logging.info(f"DataFrame vazio para '{table_name}', nada a carregar.")
         return
@@ -88,12 +151,11 @@ def load_data_to_bigquery(df, table_name):
     table_id = f"{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.{table_name}"
     
     try:
-        # Limpa o DataFrame antes de carregar
-        df_clean = clean_dataframe_for_bigquery(df)
+        # Mapeia e limpa o DataFrame
+        df_clean = map_and_clean_dataframe(df, field_mapping)
         
-        logging.info(f"Carregando {len(df_clean)} registro(s) na tabela '{table_name}'...")
+        logging.info(f"Carregando {len(df_clean)} registro(s) com {len(df_clean.columns)} campos na tabela '{table_name}'...")
         
-        # Usa pandas_gbq diretamente (método recomendado)
         pandas_gbq.to_gbq(
             df_clean,
             destination_table=table_id,
@@ -105,7 +167,7 @@ def load_data_to_bigquery(df, table_name):
         logging.info(f"{len(df_clean)} registro(s) carregado(s) com sucesso na tabela '{table_name}'.")
     except Exception as e:
         logging.error(f"Falha ao carregar dados na tabela '{table_name}': {e}")
-        logging.error(f"Tipos de dados do DataFrame: {df.dtypes.to_dict()}")
+        logging.error(f"Colunas no DataFrame limpo: {list(df_clean.columns) if 'df_clean' in locals() else 'N/A'}")
         raise
 
 def process_single_id(pncp_id):
@@ -122,17 +184,17 @@ def process_single_id(pncp_id):
         if contratacoes_list:
             df = pd.json_normalize(contratacoes_list)
             logging.info(f"ID {pncp_id}: {len(df)} registro(s) de contratação encontrado(s).")
-            load_data_to_bigquery(df, 'compras')
+            load_data_to_bigquery(df, 'compras', COMPRAS_FIELD_MAPPING)
 
         if itens_data and itens_data.get('resultado'):
             df = pd.json_normalize(itens_data.get('resultado', []))
             logging.info(f"ID {pncp_id}: {len(df)} item(ns) de compra encontrado(s).")
-            load_data_to_bigquery(df, 'itens_compra')
+            load_data_to_bigquery(df, 'itens_compra', ITENS_FIELD_MAPPING)
 
         if resultados_data and resultados_data.get('resultado'):
             df = pd.json_normalize(resultados_data.get('resultado', []))
             logging.info(f"ID {pncp_id}: {len(df)} resultado(s) de item encontrado(s).")
-            load_data_to_bigquery(df, 'resultados_itens')
+            load_data_to_bigquery(df, 'resultados_itens', RESULTADOS_FIELD_MAPPING)
 
     except Exception as e:
         logging.warning(f"Falha ao processar completamente o ID {pncp_id}.")
