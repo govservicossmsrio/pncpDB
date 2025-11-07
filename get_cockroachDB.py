@@ -45,69 +45,69 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =====================================================
-# SCHEMAS
+# SCHEMAS (TODOS EM MINÚSCULAS)
 # =====================================================
 
 COMPRAS_SCHEMA = {
-    "idCompra": "STRING",
-    "numeroCompra": "STRING",
-    "anoCompraPncp": "INTEGER",
-    "codigoModalidade": "INTEGER",
-    "modalidadeNome": "STRING",
+    "idcompra": "STRING",
+    "numerocompra": "STRING",
+    "anocomprapncp": "INTEGER",
+    "codigomodalidade": "INTEGER",
+    "modalidadenome": "STRING",
     "srp": "BOOLEAN",
-    "unidadeOrgaoCodigoUnidade": "STRING",
-    "unidadeOrgaoNomeUnidade": "STRING",
-    "unidadeOrgaoMunicipioNome": "STRING",
-    "unidadeOrgaoUfSigla": "STRING",
+    "unidadeorgaocodigounidade": "STRING",
+    "unidadeorgaonomeunidade": "STRING",
+    "unidadeorgaomunicipionome": "STRING",
+    "unidadeorgaoufsigla": "STRING",
     "processo": "STRING",
-    "objetoCompra": "STRING",
-    "valorTotalEstimado": "FLOAT",
-    "valorTotalHomologado": "FLOAT",
-    "existeResultado": "BOOLEAN",
-    "dataAberturaPropostaPncp": "TIMESTAMP",
-    "contratacaoExcluida": "BOOLEAN",
-    "itensTotal": "INTEGER",
-    "itensResultados": "INTEGER",
-    "itensHomologados": "INTEGER",
-    "itensFracassados": "INTEGER",
-    "itensDesertos": "INTEGER",
-    "itensOutros": "INTEGER",
+    "objetocompra": "STRING",
+    "valortotalestimado": "FLOAT",
+    "valortotalhomologado": "FLOAT",
+    "existeresultado": "BOOLEAN",
+    "dataaberturapropostapncp": "TIMESTAMP",
+    "contratacaoexcluida": "BOOLEAN",
+    "itenstotal": "INTEGER",
+    "itensresultados": "INTEGER",
+    "itenshomologados": "INTEGER",
+    "itensfracassados": "INTEGER",
+    "itensdesertos": "INTEGER",
+    "itensoutros": "INTEGER",
 }
 
 ITENS_SCHEMA = {
-    "idCompraItem": "STRING",
-    "idCompra": "STRING",
-    "numeroItemCompra": "INTEGER",
-    "numeroGrupo": "INTEGER",
-    "materialOuServicoNome": "STRING",
-    "tipoBeneficioNome": "STRING",
-    "codItemCatalogo": "STRING",
-    "descricaoResumida": "STRING",
+    "idcompraitem": "STRING",
+    "idcompra": "STRING",
+    "numeroitemcompra": "INTEGER",
+    "numerogrupo": "INTEGER",
+    "materialouserviconome": "STRING",
+    "tipobeneficionome": "STRING",
+    "coditemcatalogo": "STRING",
+    "descricaoresumida": "STRING",
     "descricaodetalhada": "STRING",
     "quantidade": "FLOAT",
-    "unidadeMedida": "STRING",
-    "valorUnitarioEstimado": "FLOAT",
-    "valorTotal": "FLOAT",
-    "temResultado": "BOOLEAN",
-    "situacaoCompraItemNome": "STRING",
-    "cnpjFornecedor": "STRING",
-    "nomeFornecedor": "STRING",
+    "unidademedida": "STRING",
+    "valorunitarioestimado": "FLOAT",
+    "valortotal": "FLOAT",
+    "temresultado": "BOOLEAN",
+    "situacaocompraitemnome": "STRING",
+    "cnpjfornecedor": "STRING",
+    "nomefornecedor": "STRING",
 }
 
 RESULTADOS_SCHEMA = {
-    "idCompraItem": "STRING",
-    "idCompra": "STRING",
-    "niFornecedor": "STRING",
-    "tipoPessoa": "STRING",
-    "nomeRazaoSocialFornecedor": "STRING",
-    "naturezaJuridicaNome": "STRING",
-    "porteFornecedorNome": "STRING",
-    "quantidadeHomologada": "FLOAT",
-    "valorUnitarioHomologado": "FLOAT",
-    "valorTotalHomologado": "FLOAT",
-    "percentualDesconto": "FLOAT",
-    "dataResultadoPncp": "TIMESTAMP",
-    "aplicacaoBeneficioMeepp": "BOOLEAN",
+    "idcompraitem": "STRING",
+    "idcompra": "STRING",
+    "nifornecedor": "STRING",
+    "tipopessoa": "STRING",
+    "nomerazaosocialfornecedor": "STRING",
+    "naturezajuridicanome": "STRING",
+    "portefornecedornome": "STRING",
+    "quantidadehomologada": "FLOAT",
+    "valorunitariohomologado": "FLOAT",
+    "valortotalhomologado": "FLOAT",
+    "percentualdesconto": "FLOAT",
+    "dataresultadopncp": "TIMESTAMP",
+    "aplicacaobeneficiomeepp": "BOOLEAN",
 }
 
 # =====================================================
@@ -175,19 +175,28 @@ def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
         logger.warning(f"Erro ao converter coluna: {e}")
         return series
 
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza nomes de colunas removendo pontos e convertendo para minúsculas"""
+    df.columns = df.columns.str.replace('.', '', regex=False).str.lower()
+    return df
+
 def map_and_clean_dataframe(df: pd.DataFrame, schema: Dict[str, str]) -> pd.DataFrame:
     """Mapeia e limpa DataFrame conforme schema"""
     if df.empty:
         return pd.DataFrame(columns=list(schema.keys()) + ['data_extracao'])
     
+    # Normalizar nomes de colunas
+    df = normalize_column_names(df)
+    
     result_df = pd.DataFrame()
     
-    # Seleciona apenas campos que existem no schema E no DataFrame
+    # Mapear colunas do schema
     for col, dtype in schema.items():
         if col in df.columns:
             result_df[col] = convert_column_type(df[col], dtype)
         else:
             result_df[col] = None
+            logger.debug(f"Coluna {col} não encontrada no DataFrame")
     
     result_df['data_extracao'] = datetime.utcnow()
     
@@ -198,7 +207,7 @@ def map_and_clean_dataframe(df: pd.DataFrame, schema: Dict[str, str]) -> pd.Data
 # =====================================================
 
 def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, str]) -> bool:
-    """Carrega dados no CockroachDB com case-sensitive column names"""
+    """Carrega dados no CockroachDB"""
     if df.empty:
         logger.warning(f"DataFrame vazio para tabela {table_name}")
         return False
@@ -208,17 +217,14 @@ def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, 
         cursor = conn.cursor()
         
         columns = list(schema.keys()) + ['data_extracao']
-        
-        # Usar aspas duplas para preservar case-sensitivity
-        columns_quoted = [f'"{col}"' for col in columns]
         placeholders = ', '.join(['%s'] * len(columns))
-        columns_str = ', '.join(columns_quoted)
+        columns_str = ', '.join(columns)
         
         # Determina a coluna de conflito
-        conflict_column = '"idCompraItem"' if table_name != "compras" else '"idCompra"'
+        conflict_column = "idcompraitem" if table_name != "compras" else "idcompra"
         
-        # Criar lista de SET clauses para UPDATE
-        set_clauses = ', '.join([f'"{col}" = EXCLUDED."{col}"' for col in columns])
+        # Criar SET clauses para UPDATE
+        set_clauses = ', '.join([f'{col} = EXCLUDED.{col}' for col in columns])
         
         insert_query = f"""
             INSERT INTO {table_name} ({columns_str})
@@ -227,8 +233,10 @@ def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, 
             DO UPDATE SET {set_clauses}
         """
         
+        # Preparar dados
         data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
         
+        # Executar batch insert
         execute_batch(cursor, insert_query, data_tuples, page_size=1000)
         
         conn.commit()
@@ -254,7 +262,7 @@ def process_single_id(pncp_id: str) -> bool:
     try:
         logger.info(f"Processando ID: {pncp_id}")
         
-        # 1. Extração de compras
+        # 1. Extração de contratações (compras)
         contratacoes_data = get_pncp_data("CONTRATACOES", pncp_id)
         
         if not contratacoes_data or not contratacoes_data.get('resultado'):
@@ -263,6 +271,10 @@ def process_single_id(pncp_id: str) -> bool:
         
         # Normaliza dados de compras
         compras_df = pd.json_normalize(contratacoes_data.get('resultado', []))
+        
+        # Debug: mostrar colunas recebidas
+        logger.debug(f"Colunas recebidas da API: {compras_df.columns.tolist()}")
+        
         compras_df = map_and_clean_dataframe(compras_df, COMPRAS_SCHEMA)
         
         if not load_data_to_cockroach(compras_df, "compras", COMPRAS_SCHEMA):
@@ -273,21 +285,31 @@ def process_single_id(pncp_id: str) -> bool:
         
         if itens_data and itens_data.get('resultado'):
             itens_df = pd.json_normalize(itens_data.get('resultado', []))
+            logger.debug(f"Colunas de itens recebidas: {itens_df.columns.tolist()}")
+            
             itens_df = map_and_clean_dataframe(itens_df, ITENS_SCHEMA)
             load_data_to_cockroach(itens_df, "itens_compra", ITENS_SCHEMA)
+        else:
+            logger.info(f"Sem itens para ID {pncp_id}")
         
         # 3. Extração de resultados
         resultados_data = get_pncp_data("RESULTADOS", pncp_id)
         
         if resultados_data and resultados_data.get('resultado'):
             resultados_df = pd.json_normalize(resultados_data.get('resultado', []))
+            logger.debug(f"Colunas de resultados recebidas: {resultados_df.columns.tolist()}")
+            
             resultados_df = map_and_clean_dataframe(resultados_df, RESULTADOS_SCHEMA)
             load_data_to_cockroach(resultados_df, "resultados_itens", RESULTADOS_SCHEMA)
+        else:
+            logger.info(f"Sem resultados para ID {pncp_id}")
         
         return True
         
     except Exception as e:
         logger.error(f"Erro ao processar ID {pncp_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 # =====================================================
@@ -311,7 +333,7 @@ def main():
         # 2. Verificar IDs já processados
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT idCompra FROM compras")
+        cursor.execute("SELECT idcompra FROM compras")
         processed_ids = set(row[0] for row in cursor.fetchall())
         cursor.close()
         conn.close()
@@ -370,9 +392,12 @@ def main():
                     time.sleep(delay)
         
         logger.info("--- ETL Pipeline concluído ---")
+        logger.info(f"Total processado: {len(ids_list) - len(pending_ids)}/{len(ids_list)}")
         
     except Exception as e:
         logger.error(f"Erro no pipeline principal: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise
 
 if __name__ == "__main__":
