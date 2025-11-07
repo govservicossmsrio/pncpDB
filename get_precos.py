@@ -29,6 +29,7 @@ CONFIG = {
     "SUCCESS_DELAY_SECONDS": 2,
     "MAX_RETRIES_PER_ITEM": 3,
     "RETRY_DELAY_SECONDS": 5,
+    "MAX_CONSECUTIVE_FAILURES": 30,  # Limite global de falhas consecutivas
 }
 
 # =====================================================
@@ -384,17 +385,29 @@ def main():
             logger.info("Nenhum código pendente para processar")
             return
         
-        # 2. Processar em batches
+        # 2. Processar em batches com controle de falhas consecutivas
         total = len(pending_codes)
         processed = 0
         failed = 0
+        consecutive_failures = 0  # Contador global de falhas consecutivas
         
         for i in range(0, len(pending_codes), CONFIG["BATCH_SIZE"]):
             batch = pending_codes[i:i + CONFIG["BATCH_SIZE"]]
             
             logger.info(f"\n>>> Processando lote {i//CONFIG['BATCH_SIZE'] + 1} ({len(batch)} códigos)")
+            logger.info(f"Falhas consecutivas: {consecutive_failures}/{CONFIG['MAX_CONSECUTIVE_FAILURES']}")
             
             for codigo, tipo in batch:
+                # Verificar limite de falhas consecutivas
+                if consecutive_failures >= CONFIG["MAX_CONSECUTIVE_FAILURES"]:
+                    logger.critical(f"🛑 LIMITE DE FALHAS CONSECUTIVAS ATINGIDO ({CONFIG['MAX_CONSECUTIVE_FAILURES']})")
+                    logger.critical("Parando execução para evitar bloqueio de IP")
+                    logger.info(f"\nResumo até parada:")
+                    logger.info(f"  - Processados: {processed}/{total}")
+                    logger.info(f"  - Falhas: {failed}")
+                    logger.info(f"  - Restantes: {total - processed - failed}")
+                    return
+                
                 retry_count = 0
                 success = False
                 
@@ -408,12 +421,15 @@ def main():
                 
                 if success:
                     processed += 1
+                    consecutive_failures = 0  # RESET contador ao ter sucesso
+                    logger.info(f"✅ Sucesso | Falhas consecutivas resetadas para 0")
                     time.sleep(CONFIG["SUCCESS_DELAY_SECONDS"])
                 else:
                     failed += 1
-                    logger.error(f"Código {codigo} falhou após {CONFIG['MAX_RETRIES_PER_ITEM']} tentativas")
+                    consecutive_failures += 1  # INCREMENTA contador
+                    logger.error(f"❌ Código {codigo} falhou após {CONFIG['MAX_RETRIES_PER_ITEM']} tentativas")
+                    logger.warning(f"⚠️  Falhas consecutivas: {consecutive_failures}/{CONFIG['MAX_CONSECUTIVE_FAILURES']}")
             
-            logger.info(f"Progresso: {processed}/{total} processados | {failed} falhas")
         
         # 3. Relatório final
         logger.info("\n=== Pipeline Concluído ===")
