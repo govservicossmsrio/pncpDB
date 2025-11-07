@@ -7,7 +7,7 @@ import pandas as pd
 from google.cloud import bigquery
 from google.api_core import exceptions
 import gspread
-import google.auth  # Importar a biblioteca de autenticação do Google
+import google.auth
 
 # --- CONFIGURAÇÃO DE LOG ---
 logging.basicConfig(level=logging.INFO,
@@ -32,11 +32,9 @@ CONFIG = {
     "RETRY_DELAYS_SECONDS": {3: 5, 6: 10, 9: 60, 12: 300, 15: 600, 18: "CANCEL"}
 }
 
-# --- FUNÇÕES DE API E BIGQUERY (sem alterações) ---
 def get_pncp_data(endpoint_key, id_param):
     url = f"{CONFIG['PNCP_BASE_URL']}/{CONFIG['ENDPOINTS'][endpoint_key]}"
     params = {'tipo': 'idCompra', 'codigo': id_param}
-    
     try:
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
@@ -56,7 +54,6 @@ def load_data_to_bigquery(df, table_name):
     table_id = f"{CONFIG['GCP_PROJECT_ID']}.{CONFIG['BIGQUERY_DATASET']}.{table_name}"
     try:
         df.to_gbq(destination_table=table_id, project_id=CONFIG["GCP_PROJECT_ID"], if_exists='append')
-        logging.info(f"{len(df)} registros carregados para '{table_name}'.")
     except Exception as e:
         logging.error(f"Falha ao carregar dados na tabela '{table_name}': {e}")
         raise
@@ -68,24 +65,24 @@ def process_single_id(pncp_id):
             logging.warning(f"Nenhum dado de contratação encontrado para ID {pncp_id}. Pulando.")
             return
 
-        # Assegurar que os dados retornados sejam listas
         contratacoes_list = contratacoes_data.get('data', [])
-        
-        # A lógica para as outras APIs permanece a mesma...
         itens_data = get_pncp_data("ITENS", pncp_id)
         resultados_data = get_pncp_data("RESULTADOS", pncp_id)
 
         if contratacoes_list:
-            contratacoes_df = pd.json_normalize(contratacoes_list)
-            load_data_to_bigquery(contratacoes_df, 'contratacoes')
+            df = pd.json_normalize(contratacoes_list)
+            logging.info(f"Processando {len(df)} registro(s) para a tabela 'contratacoes'.")
+            load_data_to_bigquery(df, 'contratacoes')
 
         if itens_data and itens_data.get('data'):
-            itens_df = pd.json_normalize(itens_data.get('data', []))
-            load_data_to_bigquery(itens_df, 'itens_compra')
+            df = pd.json_normalize(itens_data.get('data', []))
+            logging.info(f"Processando {len(df)} registro(s) para a tabela 'itens_compra'.")
+            load_data_to_bigquery(df, 'itens_compra')
 
         if resultados_data and resultados_data.get('data'):
-            resultados_df = pd.json_normalize(resultados_data.get('data', []))
-            load_data_to_bigquery(resultados_df, 'resultados_itens')
+            df = pd.json_normalize(resultados_data.get('data', []))
+            logging.info(f"Processando {len(df)} registro(s) para a tabela 'resultados_itens'.")
+            load_data_to_bigquery(df, 'resultados_itens')
 
     except Exception as e:
         logging.warning(f"Falha ao processar completamente o ID {pncp_id}.")
@@ -95,15 +92,20 @@ def main():
     logging.info("--- INICIANDO PIPELINE DE ETL DO PNCP ---")
     
     try:
-        # **CORREÇÃO DEFINITIVA DA AUTENTICAÇÃO**
-        # Pega as credenciais do ambiente (configuradas pelo GitHub Actions)
-        creds, project = google.auth.default()
+        # Pega as credenciais padrão do ambiente (configuradas pelo GitHub Actions).
+        creds, project_id = google.auth.default()
+
+        # Cria uma versão das credenciais com os escopos necessários para Sheets e Drive.
+        scoped_creds = creds.with_scopes([
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ])
         
-        # Autoriza o gspread com essas credenciais
-        gc = gspread.authorize(creds)
+        # Autoriza o gspread usando as credenciais com escopo.
+        gc = gspread.authorize(scoped_creds)
         
-        # Inicializa o cliente do BigQuery (ele também usará as mesmas credenciais)
-        bq_client = bigquery.Client(credentials=creds, project=project or CONFIG["GCP_PROJECT_ID"])
+        # O cliente do BigQuery usará as credenciais padrão, que já têm o escopo cloud-platform.
+        bq_client = bigquery.Client(credentials=creds, project=project_id or CONFIG["GCP_PROJECT_ID"])
 
         logging.info("Lendo IDs da planilha Google Sheets...")
         sheet = gc.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["SHEET_NAME"])
@@ -127,7 +129,6 @@ def main():
         logging.critical(f"Falha na configuração inicial. Abortando. Erro: {e}")
         return
 
-    # Lógica de processamento em lote (inalterada)
     retry_counts = {item: 0 for item in ids_to_process}
     while ids_to_process:
         batch = ids_to_process[:CONFIG["BATCH_SIZE"]]
@@ -135,9 +136,10 @@ def main():
         
         logging.info(f"--- Processando lote de {len(batch)} IDs: {batch} ---")
         
-        for item in list(batch): # Itera sobre uma cópia para poder modificar a original
+        for item in list(batch):
             if item not in ids_to_process: continue
 
+            retry_counts.setdefault(item, 0)
             retry_counts[item] += 1
             try:
                 logging.info(f"Processando ID: {item} (Tentativa {retry_counts[item]})")
