@@ -53,8 +53,9 @@ logger = logging.getLogger(__name__)
 # =====================================================
 
 PRECOS_SCHEMA = {
+    "idcompraitem": "STRING", 
     "idcompra": "STRING",
-    "numeroitemcompra": "INTEGER",
+    "numeroitemcompra": "INTEGER",  
     "coditemcatalogo": "STRING",
     "unidadeorgaocodigounidade": "STRING",
     "unidadeorgaonomeunidade": "STRING",
@@ -322,18 +323,17 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"Registros no CSV original: {len(df)}")
     logger.info(f"Colunas originais: {df.columns.tolist()[:5]}...")
     
-    # NORMALIZAÇÃO ROBUSTA (do código antigo)
+    # Normalização robusta
     df.columns = [normalizar_nome_coluna(col) for col in df.columns]
-    
-    # Tratar NaN/None (do código antigo)
     df = df.where(pd.notna(df), None)
     
     logger.info(f"Colunas normalizadas: {df.columns.tolist()[:5]}...")
     
     # Mapeamento: CSV normalizado → Banco
     column_mapping = {
+        'id_item_compra': 'idcompraitem',  # ← CSV: idItemCompra → Banco: idcompraitem (PRIMARY KEY)
         'id_compra': 'idcompra',
-        'numero_item_compra': 'numeroitemcompra',
+        'numero_item_compra': 'numeroitemcompra',  # ← ADICIONADO
         'codigo_item_catalogo': 'coditemcatalogo',
         'codigo_uasg': 'unidadeorgaocodigounidade',
         'nome_uasg': 'unidadeorgaonomeunidade',
@@ -349,7 +349,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         'data_compra': 'datacompra',
     }
     
-    # Construir dicionário de dados (MANTÉM LINHAS)
+    # Construir dicionário de dados
     result_data = {}
     
     for csv_col, schema_col in column_mapping.items():
@@ -360,7 +360,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
             )
             logger.debug(f"✓ Mapeado: {csv_col} → {schema_col}")
         else:
-            result_data[schema_col] = [None] * len(df)  # ← Preencher com None mas manter número de linhas
+            result_data[schema_col] = [None] * len(df)
             logger.warning(f"❌ Coluna '{csv_col}' não encontrada")
     
     # Adicionar colunas faltantes do schema
@@ -368,10 +368,8 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         if col not in result_data:
             result_data[col] = [None] * len(df)
     
-    # Criar DataFrame do dicionário (preserva linhas)
     result_df = pd.DataFrame(result_data)
     
-    # Adicionar metadados
     result_df['data_extracao'] = datetime.utcnow()
     result_df['versao_script'] = CONFIG["SCRIPT_VERSION"]
     
@@ -397,17 +395,34 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
         placeholders = ', '.join(['%s'] * len(columns))
         columns_str = ', '.join(columns)
         
+        # PRIMARY KEY é idcompraitem
         insert_query = f"""
             INSERT INTO precos_catalogo ({columns_str})
             VALUES ({placeholders})
-            ON CONFLICT (idcompra, numeroitemcompra)
+            ON CONFLICT (idcompraitem)
             DO UPDATE SET 
+                idcompra = EXCLUDED.idcompra,
+                numeroitemcompra = EXCLUDED.numeroitemcompra,
+                coditemcatalogo = EXCLUDED.coditemcatalogo,
+                unidadeorgaocodigounidade = EXCLUDED.unidadeorgaocodigounidade,
+                unidadeorgaonomeunidade = EXCLUDED.unidadeorgaonomeunidade,
+                unidadeorgaouf = EXCLUDED.unidadeorgaouf,
+                descricaodetalhada = EXCLUDED.descricaodetalhada,
+                quantidadehomologada = EXCLUDED.quantidadehomologada,
+                unidademedida = EXCLUDED.unidademedida,
+                valorunitariohomologado = EXCLUDED.valorunitariohomologado,
+                percentualdesconto = EXCLUDED.percentualdesconto,
+                marca = EXCLUDED.marca,
+                nifornecedor = EXCLUDED.nifornecedor,
+                nomefornecedor = EXCLUDED.nomefornecedor,
+                datacompra = EXCLUDED.datacompra,
                 data_extracao = EXCLUDED.data_extracao,
                 versao_script = EXCLUDED.versao_script
         """
         
         data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
         
+        logger.info(f"Inserindo {len(data_tuples)} registros...")
         execute_batch(cursor, insert_query, data_tuples, page_size=1000)
         
         conn.commit()
