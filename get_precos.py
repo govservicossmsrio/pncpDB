@@ -103,7 +103,7 @@ def get_db_connection():
 
 def get_pending_codes() -> List[Tuple[str, str]]:
     """
-    Retorna lista de (codigoitemcatalogo, tipo) priorizando:
+    Retorna lista de (codigo_catalogo, tipo) priorizando:
     1. Códigos nunca buscados
     2. Códigos mais antigos (data_extracao ASC)
     """
@@ -111,36 +111,56 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
+        # Primeiro, verificar qual coluna existe
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'itens_compra' 
+              AND column_name IN ('coditemcatalogo', 'codigoitemcatalogo')
+        """)
+        
+        result = cursor.fetchone()
+        
+        if not result:
+            logger.error("Nenhuma coluna de código de catálogo encontrada em itens_compra")
+            cursor.close()
+            conn.close()
+            return []
+        
+        col_name = result[0]
+        logger.info(f"Usando coluna: {col_name}")
+        
+        # Query dinâmica usando o nome correto da coluna
+        query = f"""
         WITH codigos_itens AS (
             SELECT DISTINCT 
-                codigoitemcatalogo,
+                {col_name} as codigo,
                 LOWER(materialouserviconome) as tipo_lower
             FROM itens_compra
-            WHERE codigoitemcatalogo IS NOT NULL 
-              AND codigoitemcatalogo != ''
+            WHERE {col_name} IS NOT NULL 
+              AND {col_name} != ''
               AND materialouserviconome IS NOT NULL
         ),
         codigos_processados AS (
             SELECT DISTINCT 
-                codigoitemcatalogo,
+                codigoitemcatalogo as codigo,
                 MAX(data_extracao) as ultima_extracao
             FROM precos_catalogo
             GROUP BY codigoitemcatalogo
         )
         SELECT 
-            ci.codigoitemcatalogo,
+            ci.codigo,
             CASE 
                 WHEN ci.tipo_lower LIKE '%material%' THEN 'MATERIAL'
                 WHEN ci.tipo_lower LIKE '%servi%' THEN 'SERVICO'
                 ELSE 'MATERIAL'
             END as tipo
         FROM codigos_itens ci
-        LEFT JOIN codigos_processados cp ON ci.codigoitemcatalogo = cp.codigoitemcatalogo
+        LEFT JOIN codigos_processados cp ON ci.codigo = cp.codigo
         ORDER BY 
-            CASE WHEN cp.codigoitemcatalogo IS NULL THEN 0 ELSE 1 END,
+            CASE WHEN cp.codigo IS NULL THEN 0 ELSE 1 END,
             cp.ultima_extracao ASC NULLS FIRST,
-            ci.codigoitemcatalogo
+            ci.codigo
         """
         
         cursor.execute(query)
