@@ -34,11 +34,11 @@ CONFIG = {
     "MAX_CONSECUTIVE_API_ERRORS": 6,
     "MAX_ERRORS_PER_CODE": 10,
     "EXECUTION_TIME_LIMIT_HOURS": 1,
-    "SCRIPT_VERSION": "v2.0.1",
+    "SCRIPT_VERSION": "v2.0.2",
     
     # ===== MODO TESTE =====
-    "MODO_TESTE": True,
-    "TESTE_CODIGOS": ["439495", "1333"],
+    "MODO_TESTE": False,
+    "TESTE_CODIGOS": ["439495"],
 }
 
 # =====================================================
@@ -60,7 +60,7 @@ should_stop = False
 db_errors_log = []
 
 # =====================================================
-# SCHEMA PRECOS_CATALOGO (TODOS STRING - SEM CONVERSÃO)
+# SCHEMA PRECOS_CATALOGO
 # =====================================================
 
 PRECOS_SCHEMA = {
@@ -110,6 +110,36 @@ def normalizar_nome_coluna(nome: str) -> str:
     s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
     s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
+
+def convert_brazilian_number_to_decimal(value) -> Optional[str]:
+    """
+    Converte número brasileiro para formato decimal aceito pelo banco
+    
+    Exemplos:
+        "1,00" → "1.00"
+        "4.668,00" → "4668.00"
+        "19.760,00" → "19760.00"
+        "" → None
+        None → None
+    """
+    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
+        return None
+    
+    value_str = str(value).strip()
+    
+    # Remove pontos de milhar e troca vírgula por ponto
+    # Formato brasileiro: 1.234.567,89
+    # Formato americano: 1234567.89
+    value_str = value_str.replace('.', '')  # Remove pontos de milhar
+    value_str = value_str.replace(',', '.')  # Troca vírgula por ponto
+    
+    return value_str
+
+def convert_to_string_safe(value) -> Optional[str]:
+    """Converte valor para string de forma segura, retornando None para vazios"""
+    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
+        return None
+    return str(value).strip()
 
 def check_execution_time() -> bool:
     """Verifica se o tempo de execução foi excedido"""
@@ -414,31 +444,16 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
 # FUNÇÕES DE TRANSFORMAÇÃO
 # =====================================================
 
-def convert_to_string_safe(value) -> Optional[str]:
-    """Converte valor para string de forma segura, retornando None para vazios"""
-    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
-        return None
-    return str(value).strip()
-
 def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapeia colunas do CSV para o schema do banco (SEM CONVERSÃO DE TIPO)"""
+    """Mapeia colunas do CSV para o schema do banco"""
     if df.empty:
         return pd.DataFrame(columns=list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script'])
     
     logger.info(f"Registros no CSV original: {len(df)}")
     logger.info(f"Total de colunas no CSV: {len(df.columns)}")
-    logger.info(f"Colunas completas: {df.columns.tolist()}")
     
     # Normalização
     df.columns = [normalizar_nome_coluna(col) for col in df.columns]
-    
-    logger.info(f"Colunas normalizadas: {df.columns.tolist()}")
-    
-    # DEBUG: Verificar valores antes do mapeamento
-    if 'quantidade' in df.columns:
-        logger.info(f"DEBUG - quantidade (primeiros 3 valores): {df['quantidade'].head(3).tolist()}")
-    if 'preco_unitario' in df.columns:
-        logger.info(f"DEBUG - preco_unitario (primeiros 3 valores): {df['preco_unitario'].head(3).tolist()}")
     
     # Validação de colunas obrigatórias
     if 'id_compra' not in df.columns or 'numero_item_compra' not in df.columns:
@@ -446,9 +461,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         logger.error(f"Colunas disponíveis: {df.columns.tolist()}")
         raise DataValidationError("Colunas obrigatórias ausentes no CSV")
     
-    # =====================================================
-    # CONSTRUÇÃO DO idcompraitem (PRIMARY KEY COMPOSTA)
-    # =====================================================
+    # Construção do idcompraitem
     df['idcompraitem_construido'] = (
         df['id_compra'].astype(str).str.strip() + 
         df['numero_item_compra'].astype(str).str.strip().str.zfill(5)
@@ -456,9 +469,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"✓ idcompraitem construído (exemplo): {df['idcompraitem_construido'].iloc[0]}")
     
-    # =====================================================
-    # TRATAMENTO DE DUPLICATAS
-    # =====================================================
+    # Tratamento de duplicatas
     registros_antes = len(df)
     
     if 'data_hora_atualizacao_item' in df.columns:
@@ -472,54 +483,56 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         
         registros_removidos = registros_antes - len(df)
         if registros_removidos > 0:
-            logger.warning(f"⚠️  {registros_removidos} duplicatas removidas (mantido registro mais recente)")
+            logger.warning(f"⚠️  {registros_removidos} duplicatas removidas")
     else:
-        logger.warning("⚠️  Coluna 'data_hora_atualizacao_item' não encontrada")
         df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
     
     logger.info(f"Registros após deduplicação: {len(df)}")
     
     # =====================================================
-    # MAPEAMENTO: CSV normalizado → Banco (SEM CONVERSÃO)
+    # MAPEAMENTO COM CONVERSÃO NUMÉRICA
     # =====================================================
     column_mapping = {
-        'idcompraitem_construido': 'idcompraitem',
-        'id_compra': 'idcompra',
-        'numero_item_compra': 'numeroitemcompra',
-        'codigo_item_catalogo': 'coditemcatalogo',
-        'descricao_item': 'descricaodetalhada',
-        'quantidade': 'quantidadehomologada',
-        'sigla_unidade_medida': 'unidademedida',
-        'preco_unitario': 'valorunitariohomologado',
-        'percentual_maior_desconto': 'percentualdesconto',
-        'marca': 'marca',
-        'ni_fornecedor': 'nifornecedor',
-        'nome_fornecedor': 'nomefornecedor',
-        'codigo_uasg': 'unidadeorgaocodigounidade',
-        'nome_uasg': 'unidadeorgaonomeunidade',
-        'estado': 'unidadeorgaouf',
-        'data_compra': 'datacompra',
+        'idcompraitem_construido': ('idcompraitem', 'string'),
+        'id_compra': ('idcompra', 'string'),
+        'numero_item_compra': ('numeroitemcompra', 'string'),
+        'codigo_item_catalogo': ('coditemcatalogo', 'string'),
+        'descricao_item': ('descricaodetalhada', 'string'),
+        'quantidade': ('quantidadehomologada', 'decimal'),  # ← CONVERSÃO NUMÉRICA
+        'sigla_unidade_medida': ('unidademedida', 'string'),
+        'preco_unitario': ('valorunitariohomologado', 'decimal'),  # ← CONVERSÃO NUMÉRICA
+        'percentual_maior_desconto': ('percentualdesconto', 'decimal'),  # ← CONVERSÃO NUMÉRICA
+        'marca': ('marca', 'string'),
+        'ni_fornecedor': ('nifornecedor', 'string'),
+        'nome_fornecedor': ('nomefornecedor', 'string'),
+        'codigo_uasg': ('unidadeorgaocodigounidade', 'string'),
+        'nome_uasg': ('unidadeorgaonomeunidade', 'string'),
+        'estado': ('unidadeorgaouf', 'string'),
+        'data_compra': ('datacompra', 'string'),
     }
     
     result_data = {}
     
-    for csv_col, schema_col in column_mapping.items():
+    for csv_col, (schema_col, col_type) in column_mapping.items():
         if csv_col in df.columns:
-            # Converte para string sem aplicar conversões de tipo
-            result_data[schema_col] = df[csv_col].apply(convert_to_string_safe)
+            if col_type == 'decimal':
+                # Converte números brasileiros para formato decimal
+                result_data[schema_col] = df[csv_col].apply(convert_brazilian_number_to_decimal)
+            else:
+                # String normal
+                result_data[schema_col] = df[csv_col].apply(convert_to_string_safe)
             
-            # Log para depuração
             not_null_count = result_data[schema_col].notna().sum()
             logger.info(f"✓ Mapeado: {csv_col} → {schema_col} ({not_null_count}/{len(df)} não-nulos)")
         else:
-            logger.warning(f"❌ Coluna '{csv_col}' não encontrada no CSV")
+            if schema_col != 'marca':  # marca não existe no CSV, não precisa logar
+                logger.warning(f"❌ Coluna '{csv_col}' não encontrada no CSV")
             result_data[schema_col] = [None] * len(df)
     
     # Adicionar colunas faltantes do schema
     for col in PRECOS_SCHEMA.keys():
         if col not in result_data:
             result_data[col] = [None] * len(df)
-            logger.debug(f"⚠️  Coluna '{col}' preenchida com NULL (não mapeada)")
     
     result_df = pd.DataFrame(result_data)
     
@@ -580,17 +593,9 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
                 versao_script = EXCLUDED.versao_script
         """
         
-        # Substitui NaN por None
         data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None, pd.NaT: None}).values]
         
         logger.info(f"Inserindo {len(data_tuples)} registros...")
-        
-        # DEBUG: Log primeiro registro
-        if data_tuples:
-            logger.info(f"DEBUG - Primeiro registro a ser inserido:")
-            for i, col in enumerate(columns):
-                logger.info(f"  {col}: {data_tuples[0][i]}")
-        
         execute_batch(cursor, insert_query, data_tuples, page_size=1000)
         
         conn.commit()
@@ -614,15 +619,10 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
 # =====================================================
 
 def process_single_code(codigo: str, tipo: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Processa um único código de catálogo
-    
-    Returns:
-    """
+    """Processa um único código de catálogo"""
     try:
         logger.info(f"--- Processando código: {codigo} ({tipo}) ---")
         
-        # Busca na API
         try:
             df_raw = fetch_all_pages(codigo, tipo)
         except APIError as e:
@@ -632,13 +632,11 @@ def process_single_code(codigo: str, tipo: str) -> Tuple[bool, Optional[str], Op
             logger.warning(f"Sem dados para código {codigo}")
             return (False, 'VALIDATION', 'Nenhum dado retornado pela API')
         
-        # Transformação
         try:
             df_clean = map_csv_to_schema(df_raw)
         except DataValidationError as e:
             return (False, 'VALIDATION', str(e))
         
-        # Carga no banco
         try:
             load_precos_to_cockroach(df_clean)
             return (True, None, None)
@@ -659,7 +657,6 @@ def process_code_with_retry(codigo: str, tipo: str) -> bool:
         update_control_record(codigo, tipo, True)
         return True
     
-    # Se erro de API, tenta novamente após delay
     if error_type == 'API':
         logger.warning(f"⚠️  Erro de API para {codigo}, aguardando {CONFIG['API_ERROR_RETRY_DELAY']}s...")
         time.sleep(CONFIG['API_ERROR_RETRY_DELAY'])
@@ -670,7 +667,6 @@ def process_code_with_retry(codigo: str, tipo: str) -> bool:
             update_control_record(codigo, tipo, True)
             return True
     
-    # Se erro de banco, apenas loga e pula
     if error_type == 'DATABASE':
         global db_errors_log
         db_errors_log.append({
@@ -681,7 +677,6 @@ def process_code_with_retry(codigo: str, tipo: str) -> bool:
         })
         logger.error(f"❌ Erro de banco para {codigo} - pulando")
     
-    # Atualiza controle com falha
     update_control_record(codigo, tipo, False, f"[{error_type}] {error_msg}")
     
     return False
