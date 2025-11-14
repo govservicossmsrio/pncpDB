@@ -856,4 +856,14 @@ def main():
         
     except DatabaseError as e:
         logger.critical(f"❌ ERRO CRÍTICO DE BANCO: {e}")
-        logger.critical("Impossível continuar -
+        logger.critical("Impossível continuar - verifique conexão e credenciais")
+        raise
+        
+    except Exception as e:
+        logger.error(f"Erro fatal: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+
+if __name__ == "__main__":
+    main()
