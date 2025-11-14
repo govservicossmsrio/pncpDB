@@ -37,7 +37,7 @@ CONFIG = {
     "SCRIPT_VERSION": "v2.0.2",
     
     # ===== MODO TESTE =====
-    "MODO_TESTE": True,
+    "MODO_TESTE": False,
     "TESTE_CODIGOS": ["439495", "1333"],
 }
 
