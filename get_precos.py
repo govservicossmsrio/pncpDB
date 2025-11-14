@@ -31,7 +31,7 @@ CONFIG = {
     "MAX_RETRIES_PER_ITEM": 3,
     "RETRY_DELAY_SECONDS": 5,
     "MAX_CONSECUTIVE_FAILURES": 30,
-    "SCRIPT_VERSION": "v1.0.0",
+    "SCRIPT_VERSION": "v1.1.0",
     
     # ===== MODO TESTE =====
     "MODO_TESTE": False,
@@ -69,10 +69,11 @@ PRECOS_SCHEMA = {
     "nifornecedor": "STRING",
     "nomefornecedor": "STRING",
     "datacompra": "DATE",
+    "datahoraatualizacaoitem": "TIMESTAMP",
 }
 
 # =====================================================
-# FUNÇÕES AUXILIARES (do código antigo)
+# FUNÇÕES AUXILIARES
 # =====================================================
 
 def normalizar_nome_coluna(nome: str) -> str:
@@ -255,10 +256,9 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
             
             clean_csv = '\n'.join(lines)
             
-            # CORREÇÃO: Usar separador ; (não \t)
             df_page = pd.read_csv(
                 StringIO(clean_csv),
-                sep=';',  # ← MUDOU de \t para ;
+                sep=';',
                 encoding='utf-8',
                 on_bad_lines='warn',
                 engine='python',
@@ -309,6 +309,8 @@ def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
             return pd.to_numeric(series, errors='coerce')
         elif target_type == "DATE":
             return pd.to_datetime(series, errors='coerce').dt.date
+        elif target_type == "TIMESTAMP":
+            return pd.to_datetime(series, errors='coerce')
         else:
             return series
     except Exception as e:
@@ -321,32 +323,93 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script'])
     
     logger.info(f"Registros no CSV original: {len(df)}")
-    logger.info(f"Colunas originais: {df.columns.tolist()[:5]}...")
+    logger.info(f"Colunas originais (primeiras 10): {df.columns.tolist()[:10]}")
     
     # Normalização robusta
     df.columns = [normalizar_nome_coluna(col) for col in df.columns]
     df = df.where(pd.notna(df), None)
     
-    logger.info(f"Colunas normalizadas: {df.columns.tolist()[:5]}...")
+    logger.info(f"Colunas normalizadas (primeiras 10): {df.columns.tolist()[:10]}")
     
-    # Mapeamento: CSV normalizado → Banco
+    # =====================================================
+    # CONSTRUÇÃO DO idcompraitem (PRIMARY KEY COMPOSTA)
+    # =====================================================
+    
+    if 'id_compra' not in df.columns or 'numero_item_compra' not in df.columns:
+        logger.error("❌ Colunas obrigatórias 'id_compra' e/ou 'numero_item_compra' não encontradas")
+        logger.error(f"Colunas disponíveis: {df.columns.tolist()}")
+        raise ValueError("Colunas obrigatórias ausentes no CSV")
+    
+    # Construir idcompraitem = id_compra + numero_item_compra (5 dígitos)
+    df['idcompraitem_construido'] = (
+        df['id_compra'].astype(str) + 
+        df['numero_item_compra'].astype(str).str.zfill(5)
+    )
+    
+    logger.info(f"✓ idcompraitem construído (exemplo): {df['idcompraitem_construido'].iloc[0]}")
+    
+    # =====================================================
+    # TRATAMENTO DE DUPLICATAS
+    # =====================================================
+    
+    registros_antes = len(df)
+    
+    if 'data_hora_atualizacao_item' in df.columns:
+        # Converter para datetime
+        df['data_hora_atualizacao_item'] = pd.to_datetime(
+            df['data_hora_atualizacao_item'], 
+            errors='coerce'
+        )
+        
+        # Ordenar por data (mais recente primeiro) e remover duplicatas
+        df = df.sort_values('data_hora_atualizacao_item', ascending=False)
+        df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
+        
+        registros_removidos = registros_antes - len(df)
+        if registros_removidos > 0:
+            logger.warning(f"⚠️  {registros_removidos} duplicatas removidas (mantido registro mais recente)")
+    else:
+        logger.warning("⚠️  Coluna 'data_hora_atualizacao_item' não encontrada - duplicatas não tratadas")
+        df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
+    
+    logger.info(f"Registros após deduplicação: {len(df)}")
+    
+    # =====================================================
+    # MAPEAMENTO: CSV normalizado → Banco
+    # =====================================================
+    
     column_mapping = {
-        'id_item_compra': 'idcompraitem',  # ← CSV: idItemCompra → Banco: idcompraitem (PRIMARY KEY)
+        # PRIMARY KEY (construída, não do CSV)
+        'idcompraitem_construido': 'idcompraitem',
+        
+        # Identificadores
         'id_compra': 'idcompra',
-        'numero_item_compra': 'numeroitemcompra',  # ← ADICIONADO
+        'numero_item_compra': 'numeroitemcompra',
+        
+        # Item
         'codigo_item_catalogo': 'coditemcatalogo',
-        'codigo_uasg': 'unidadeorgaocodigounidade',
-        'nome_uasg': 'unidadeorgaonomeunidade',
-        'estado': 'unidadeorgaouf',
         'descricao_item': 'descricaodetalhada',
+        
+        # Quantidade e valores
         'quantidade': 'quantidadehomologada',
         'sigla_unidade_medida': 'unidademedida',
+        'nome_unidade_medida': 'unidademedida',  # fallback
         'preco_unitario': 'valorunitariohomologado',
         'percentual_maior_desconto': 'percentualdesconto',
+        
+        # Fornecedor
         'marca': 'marca',
         'ni_fornecedor': 'nifornecedor',
         'nome_fornecedor': 'nomefornecedor',
+        
+        # Órgão
+        'codigo_uasg': 'unidadeorgaocodigounidade',
+        'nome_uasg': 'unidadeorgaonomeunidade',
+        'estado': 'unidadeorgaouf',
+        
+        # Datas
         'data_compra': 'datacompra',
+        'data_hora_atualizacao_item': 'datahoraatualizacaoitem',
     }
     
     # Construir dicionário de dados
@@ -354,19 +417,22 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     for csv_col, schema_col in column_mapping.items():
         if csv_col in df.columns:
-            result_data[schema_col] = convert_column_type(
-                df[csv_col],
-                PRECOS_SCHEMA.get(schema_col, "STRING")
-            )
-            logger.debug(f"✓ Mapeado: {csv_col} → {schema_col}")
+            # Evitar sobrescrever se já mapeado (prioridade para primeira ocorrência)
+            if schema_col not in result_data or result_data[schema_col] is None:
+                result_data[schema_col] = convert_column_type(
+                    df[csv_col],
+                    PRECOS_SCHEMA.get(schema_col, "STRING")
+                )
+                logger.debug(f"✓ Mapeado: {csv_col} → {schema_col}")
         else:
-            result_data[schema_col] = [None] * len(df)
-            logger.warning(f"❌ Coluna '{csv_col}' não encontrada")
+            if schema_col not in result_data:
+                logger.debug(f"⚠️  Coluna '{csv_col}' não encontrada no CSV")
     
-    # Adicionar colunas faltantes do schema
+    # Adicionar colunas faltantes do schema (com None)
     for col in PRECOS_SCHEMA.keys():
         if col not in result_data:
             result_data[col] = [None] * len(df)
+            logger.debug(f"⚠️  Coluna '{col}' preenchida com NULL (não encontrada no CSV)")
     
     result_df = pd.DataFrame(result_data)
     
@@ -374,6 +440,13 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     result_df['versao_script'] = CONFIG["SCRIPT_VERSION"]
     
     logger.info(f"✓ DataFrame final: {len(result_df)} registros, {len(result_df.columns)} colunas")
+    
+    # Verificação de colunas NULL críticas
+    colunas_criticas = ['quantidadehomologada', 'unidademedida', 'valorunitariohomologado']
+    for col in colunas_criticas:
+        null_count = result_df[col].isna().sum()
+        if null_count > 0:
+            logger.warning(f"⚠️  Coluna '{col}' tem {null_count} valores NULL de {len(result_df)} registros")
     
     return result_df
 
@@ -416,6 +489,7 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
                 nifornecedor = EXCLUDED.nifornecedor,
                 nomefornecedor = EXCLUDED.nomefornecedor,
                 datacompra = EXCLUDED.datacompra,
+                datahoraatualizacaoitem = EXCLUDED.datahoraatualizacaoitem,
                 data_extracao = EXCLUDED.data_extracao,
                 versao_script = EXCLUDED.versao_script
         """
