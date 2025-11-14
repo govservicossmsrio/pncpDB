@@ -529,7 +529,7 @@ def call_api_with_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str],
                 return (endpoint_key, False, error_msg)
         else:
             logger.info(f"Sem dados para {endpoint_key} - ID {pncp_id}")
-            return (endpoint_key, True, None)  # Considera sucesso se não há dados
+            return (endpoint_key, True, None)
         
     except Exception as e:
         error_msg = f"Exceção em {endpoint_key} - ID {pncp_id}: {str(e)}"
@@ -658,10 +658,10 @@ def main():
             logger.info("Nenhum ID para processar")
             return
         
-        # Dicionário para rastrear falhas: {idcompra: (origem, [apis_falhadas])}
+        # Dicionário para rastrear falhas
         failed_ids = {}
         
-        # 2. PRIMEIRA PASSAGEM - Processar todos os IDs
+        # 2. PRIMEIRA PASSAGEM
         logger.info("=== INICIANDO PRIMEIRA PASSAGEM ===")
         
         for idcompra, origem in search_list:
@@ -670,27 +670,28 @@ def main():
                 
                 if not success:
                     failed_ids[idcompra] = (origem, failed_apis)
-                    logger.warning(f"ID {idcompra} teve falhas em: {', '.join(failed_apis)}")
+                    apis_str = ', '.join(failed_apis)
+                    logger.warning(f"ID {idcompra} teve falhas em: {apis_str}")
                 else:
                     logger.info(f"✓ ID {idcompra} processado com sucesso total")
                 
-                # Delay de 2s antes do próximo ID
                 time.sleep(CONFIG['SUCCESS_DELAY_SECONDS'])
                 
             except Exception as e:
                 logger.error(f"Erro ao processar ID {idcompra}: {e}")
                 failed_ids[idcompra] = (origem, ["CONTRATACOES", "ITENS", "RESULTADOS"])
         
-        # 3. SEGUNDA PASSAGEM - Reprocessar apenas APIs falhadas
+        # 3. SEGUNDA PASSAGEM
         if failed_ids:
-            logger.info(f"\n=== INICIANDO SEGUNDA PASSAGEM ===")
+            logger.info("\n=== INICIANDO SEGUNDA PASSAGEM ===")
             logger.info(f"Reprocessando {len(failed_ids)} IDs com falhas")
             
             final_errors = []
             
             for idcompra, (origem, failed_apis) in failed_ids.items():
                 try:
-                    logger.info(f"Reprocessando ID {idcompra} - APIs: {', '.join(failed_apis)}")
+                    apis_str = ', '.join(failed_apis)
+                    logger.info(f"Reprocessando ID {idcompra} - APIs: {apis_str}")
                     
                     success, still_failed = process_single_id(
                         idcompra, 
@@ -706,11 +707,11 @@ def main():
                             'apis_falhadas': still_failed
                         }
                         final_errors.append(error_entry)
-                        logger.error(f"ERRO FINAL - ID: {idcompra}, APIs falhadas: {', '.join(still_failed)}, origem: {origem}")
+                        apis_str2 = ', '.join(still_failed)
+                        logger.error(f"ERRO FINAL - ID: {idcompra}, APIs falhadas: {apis_str2}, origem: {origem}")
                     else:
                         logger.info(f"✓ ID {idcompra} recuperado com sucesso na 2ª passagem")
                     
-                    # Delay de 2s antes do próximo ID
                     time.sleep(CONFIG['SUCCESS_DELAY_SECONDS'])
                     
                 except Exception as e:
@@ -723,10 +724,11 @@ def main():
                     })
             
             # Log final de erros
-             if final_errors:
+            if final_errors:
                 logger.error("\n=== RESUMO DE ERROS FINAIS ===")
                 for error in final_errors:
                     apis_str = ', '.join(error['apis_falhadas'])
+                    logger.error(msg)
         
         # 4. Estatísticas finais
         total_ids = len(search_list)
