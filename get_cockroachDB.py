@@ -536,6 +536,44 @@ def call_api_with_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str],
         logger.error(error_msg)
         return (endpoint_key, False, error_msg)
 
+def call_api_without_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str], 
+                           table_name: str, origem: str, filter_items: Optional[Set[str]] = None) -> Tuple[str, bool, Optional[str]]:
+    """
+    Chama API SEM retry (para segunda passagem)
+    Retorna: (endpoint_key, sucesso, mensagem_erro)
+    """
+    try:
+        data = get_pncp_data(endpoint_key, pncp_id)
+        
+        if not data or not data.get('resultado'):
+            error_msg = f"Falha na segunda passagem: {endpoint_key} - ID {pncp_id}"
+            logger.error(error_msg)
+            return (endpoint_key, False, error_msg)
+        
+        # Sucesso na obtenção dos dados
+        df = pd.json_normalize(data.get('resultado', []))
+        df = map_and_clean_dataframe(df, schema)
+        
+        # Aplicar filtro se necessário
+        if filter_items is not None and not df.empty and 'idcompraitem' in df.columns:
+            df = df[df['idcompraitem'].isin(filter_items)]
+        
+        if not df.empty:
+            success = load_data_to_cockroach(df, table_name, schema, origem)
+            if success:
+                logger.info(f"✓ {endpoint_key} processado com sucesso na 2ª passagem - ID {pncp_id}")
+                return (endpoint_key, True, None)
+            else:
+                error_msg = f"Falha ao salvar dados na 2ª passagem: {endpoint_key} - ID {pncp_id}"
+                return (endpoint_key, False, error_msg)
+        else:
+            return (endpoint_key, True, None)
+        
+    except Exception as e:
+        error_msg = f"Exceção na 2ª passagem - {endpoint_key} - ID {pncp_id}: {str(e)}"
+        logger.error(error_msg)
+        return (endpoint_key, False, error_msg)
+
 def process_single_id(pncp_id: str, origem: str, apis_to_process: Optional[List[str]] = None, 
                       allow_retry: bool = True) -> Tuple[bool, List[str]]:
     """
@@ -599,45 +637,7 @@ def process_single_id(pncp_id: str, origem: str, apis_to_process: Optional[List[
         logger.error(f"Erro ao processar ID {pncp_id}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return (False, apis_to_process)
-
-def call_api_without_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str], 
-                           table_name: str, origem: str, filter_items: Optional[Set[str]] = None) -> Tuple[str, bool, Optional[str]]:
-    """
-    Chama API SEM retry (para segunda passagem)
-    Retorna: (endpoint_key, sucesso, mensagem_erro)
-    """
-    try:
-        data = get_pncp_data(endpoint_key, pncp_id)
-        
-        if not data or not data.get('resultado'):
-            error_msg = f"Falha na segunda passagem: {endpoint_key} - ID {pncp_id}"
-            logger.error(error_msg)
-            return (endpoint_key, False, error_msg)
-        
-        # Sucesso na obtenção dos dados
-        df = pd.json_normalize(data.get('resultado', []))
-        df = map_and_clean_dataframe(df, schema)
-        
-        # Aplicar filtro se necessário
-        if filter_items is not None and not df.empty and 'idcompraitem' in df.columns:
-            df = df[df['idcompraitem'].isin(filter_items)]
-        
-        if not df.empty:
-            success = load_data_to_cockroach(df, table_name, schema, origem)
-            if success:
-                logger.info(f"✓ {endpoint_key} processado com sucesso na 2ª passagem - ID {pncp_id}")
-                return (endpoint_key, True, None)
-            else:
-                error_msg = f"Falha ao salvar dados na 2ª passagem: {endpoint_key} - ID {pncp_id}"
-                return (endpoint_key, False, error_msg)
-        else:
-            return (endpoint_key, True, None)
-        
-    except Exception as e:
-        error_msg = f"Exceção na 2ª passagem - {endpoint_key} - ID {pncp_id}: {str(e)}"
-        logger.error(error_msg)
-        return (endpoint_key, False, error_msg)
+        return (False, apis_to_process if apis_to_process else ["CONTRATACOES", "ITENS", "RESULTADOS"])
 
 # =====================================================
 # FUNÇÃO PRINCIPAL
