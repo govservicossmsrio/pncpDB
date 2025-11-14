@@ -4,12 +4,15 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 import psycopg2
 from psycopg2.extras import execute_batch
 from typing import Dict, List, Optional, Tuple
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.exceptions import Timeout, ConnectionError
+import signal
 
 # =====================================================
 # CONFIGURAÇÃO
@@ -26,12 +29,13 @@ CONFIG = {
         "SERVICO": "modulo-pesquisa-preco/3.1_consultarServico_CSV"
     },
     "PAGE_SIZE": 200,
-    "BATCH_SIZE": 10,
-    "SUCCESS_DELAY_SECONDS": 2,
-    "MAX_RETRIES_PER_ITEM": 3,
-    "RETRY_DELAY_SECONDS": 5,
-    "MAX_CONSECUTIVE_FAILURES": 30,
-    "SCRIPT_VERSION": "v1.1.0",
+    "PARALLEL_REQUESTS": 3,
+    "STAGGER_DELAY_SECONDS": 1,
+    "API_ERROR_RETRY_DELAY": 5,
+    "MAX_CONSECUTIVE_API_ERRORS": 6,
+    "MAX_ERRORS_PER_CODE": 10,
+    "EXECUTION_TIME_LIMIT_HOURS": 1,
+    "SCRIPT_VERSION": "v2.0.0",
     
     # ===== MODO TESTE =====
     "MODO_TESTE": False,
@@ -47,6 +51,14 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# =====================================================
+# VARIÁVEIS GLOBAIS DE CONTROLE
+# =====================================================
+
+execution_start_time = None
+should_stop = False
+db_errors_log = []
 
 # =====================================================
 # SCHEMA PRECOS_CATALOGO
@@ -73,6 +85,22 @@ PRECOS_SCHEMA = {
 }
 
 # =====================================================
+# CLASSES DE ERRO PERSONALIZADAS
+# =====================================================
+
+class APIError(Exception):
+    """Erro relacionado à API (timeout, bloqueio, rate limit)"""
+    pass
+
+class DatabaseError(Exception):
+    """Erro relacionado ao banco de dados"""
+    pass
+
+class DataValidationError(Exception):
+    """Erro de validação de dados (CSV malformado)"""
+    pass
+
+# =====================================================
 # FUNÇÕES AUXILIARES
 # =====================================================
 
@@ -81,11 +109,26 @@ def normalizar_nome_coluna(nome: str) -> str:
     if not isinstance(nome, str):
         return ''
     s = nome.strip()
-    # camelCase → snake_case: idCompra → id_compra
     s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
-    # Remove caracteres especiais
     s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
+
+def check_execution_time() -> bool:
+    """Verifica se o tempo de execução foi excedido"""
+    global execution_start_time, should_stop
+    
+    if should_stop:
+        return False
+    
+    elapsed = datetime.now() - execution_start_time
+    limit = timedelta(hours=CONFIG["EXECUTION_TIME_LIMIT_HOURS"])
+    
+    if elapsed >= limit:
+        logger.warning(f"⏰ Tempo de execução atingido: {elapsed} >= {limit}")
+        should_stop = True
+        return False
+    
+    return True
 
 # =====================================================
 # CONEXÃO COM COCKROACHDB
@@ -98,14 +141,84 @@ def get_db_connection():
         return conn
     except Exception as e:
         logger.error(f"Erro ao conectar com CockroachDB: {e}")
-        raise
+        raise DatabaseError(f"Falha na conexão: {e}")
+
+# =====================================================
+# TABELA DE CONTROLE DE EXECUÇÃO
+# =====================================================
+
+def create_control_table():
+    """Cria tabela de controle de execução se não existir"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS precos_catalogo_controle (
+                codigo_catalogo STRING PRIMARY KEY,
+                tipo STRING NOT NULL,
+                tentativas_totais INT DEFAULT 0,
+                ultima_tentativa TIMESTAMP,
+                ultimo_erro TEXT,
+                ultimo_sucesso TIMESTAMP,
+                status STRING DEFAULT 'PENDENTE'
+            )
+        """)
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logger.info("✓ Tabela de controle verificada/criada")
+        
+    except Exception as e:
+        logger.error(f"Erro ao criar tabela de controle: {e}")
+        raise DatabaseError(f"Falha ao criar tabela de controle: {e}")
+
+def update_control_record(codigo: str, tipo: str, success: bool, error_msg: Optional[str] = None):
+    """Atualiza registro de controle de execução"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if success:
+            cursor.execute("""
+                INSERT INTO precos_catalogo_controle 
+                    (codigo_catalogo, tipo, tentativas_totais, ultima_tentativa, ultimo_sucesso, status)
+                VALUES (%s, %s, 1, NOW(), NOW(), 'SUCESSO')
+                ON CONFLICT (codigo_catalogo)
+                DO UPDATE SET
+                    tentativas_totais = precos_catalogo_controle.tentativas_totais + 1,
+                    ultima_tentativa = NOW(),
+                    ultimo_sucesso = NOW(),
+                    status = 'SUCESSO'
+            """, (codigo, tipo))
+        else:
+            cursor.execute("""
+                INSERT INTO precos_catalogo_controle 
+                    (codigo_catalogo, tipo, tentativas_totais, ultima_tentativa, ultimo_erro, status)
+                VALUES (%s, %s, 1, NOW(), %s, 'ERRO')
+                ON CONFLICT (codigo_catalogo)
+                DO UPDATE SET
+                    tentativas_totais = precos_catalogo_controle.tentativas_totais + 1,
+                    ultima_tentativa = NOW(),
+                    ultimo_erro = %s,
+                    status = 'ERRO'
+            """, (codigo, tipo, error_msg, error_msg))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Erro ao atualizar controle para código {codigo}: {e}")
+        # Não propaga erro de controle para não atrapalhar fluxo principal
 
 # =====================================================
 # FUNÇÕES DE BUSCA DE CÓDIGOS
 # =====================================================
 
 def get_pending_codes() -> List[Tuple[str, str]]:
-    """Retorna lista de (codigo_catalogo, tipo)"""
+    """Retorna lista de (codigo_catalogo, tipo) priorizando nunca processados"""
     try:
         if CONFIG["MODO_TESTE"]:
             logger.warning("⚠️  MODO TESTE ATIVADO ⚠️")
@@ -176,13 +289,6 @@ def get_pending_codes() -> List[Tuple[str, str]]:
             WHERE {col_itens} IS NOT NULL 
               AND {col_itens} != ''
               AND materialouserviconome IS NOT NULL
-        ),
-        codigos_processados AS (
-            SELECT DISTINCT 
-                TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE(coditemcatalogo, '\.0+$', ''))) as codigo,
-                MAX(data_extracao) as ultima_extracao
-            FROM precos_catalogo
-            GROUP BY TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE(coditemcatalogo, '\.0+$', '')))
         )
         SELECT 
             ci.codigo,
@@ -192,11 +298,17 @@ def get_pending_codes() -> List[Tuple[str, str]]:
                 ELSE 'MATERIAL'
             END as tipo
         FROM codigos_itens ci
-        LEFT JOIN codigos_processados cp ON ci.codigo = cp.codigo
+        LEFT JOIN precos_catalogo_controle ctrl ON ci.codigo = ctrl.codigo_catalogo
         WHERE ci.codigo ~ '^[0-9]+$'
+          AND (ctrl.tentativas_totais IS NULL OR ctrl.tentativas_totais < {CONFIG['MAX_ERRORS_PER_CODE']})
         ORDER BY 
-            CASE WHEN cp.codigo IS NULL THEN 0 ELSE 1 END,
-            cp.ultima_extracao ASC NULLS FIRST,
+            CASE 
+                WHEN ctrl.codigo_catalogo IS NULL THEN 0
+                WHEN ctrl.status = 'ERRO' THEN 1
+                WHEN ctrl.status = 'SUCESSO' THEN 2
+                ELSE 3
+            END,
+            ctrl.ultima_tentativa ASC NULLS FIRST,
             ci.codigo::INT
         """
         
@@ -213,7 +325,7 @@ def get_pending_codes() -> List[Tuple[str, str]]:
         logger.error(f"Erro ao buscar códigos pendentes: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return []
+        raise DatabaseError(f"Falha ao buscar códigos: {e}")
 
 # =====================================================
 # FUNÇÕES DE EXTRAÇÃO DA API
@@ -239,8 +351,15 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
             
             logger.info(f"Buscando código {codigo} ({tipo}) - Página {pagina}")
             
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
+            try:
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+            except (Timeout, ConnectionError) as e:
+                raise APIError(f"Timeout/ConnectionError na API: {e}")
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code in [429, 503]:
+                    raise APIError(f"API bloqueada/indisponível (HTTP {e.response.status_code})")
+                raise APIError(f"Erro HTTP na API: {e}")
             
             content = response.content.decode('utf-8-sig')
             
@@ -285,11 +404,13 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
         
         return df_final
         
+    except APIError:
+        raise
     except Exception as e:
-        logger.error(f"Erro ao processar código {codigo}: {e}")
+        logger.error(f"Erro inesperado ao processar código {codigo}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return None
+        raise DataValidationError(f"Erro ao processar dados: {e}")
 
 # =====================================================
 # FUNÇÕES DE TRANSFORMAÇÃO
@@ -325,22 +446,16 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"Registros no CSV original: {len(df)}")
     logger.info(f"Colunas originais (primeiras 10): {df.columns.tolist()[:10]}")
     
-    # Normalização robusta
     df.columns = [normalizar_nome_coluna(col) for col in df.columns]
     df = df.where(pd.notna(df), None)
     
     logger.info(f"Colunas normalizadas (primeiras 10): {df.columns.tolist()[:10]}")
     
-    # =====================================================
-    # CONSTRUÇÃO DO idcompraitem (PRIMARY KEY COMPOSTA)
-    # =====================================================
-    
     if 'id_compra' not in df.columns or 'numero_item_compra' not in df.columns:
         logger.error("❌ Colunas obrigatórias 'id_compra' e/ou 'numero_item_compra' não encontradas")
         logger.error(f"Colunas disponíveis: {df.columns.tolist()}")
-        raise ValueError("Colunas obrigatórias ausentes no CSV")
+        raise DataValidationError("Colunas obrigatórias ausentes no CSV")
     
-    # Construir idcompraitem = id_compra + numero_item_compra (5 dígitos)
     df['idcompraitem_construido'] = (
         df['id_compra'].astype(str) + 
         df['numero_item_compra'].astype(str).str.zfill(5)
@@ -348,20 +463,14 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"✓ idcompraitem construído (exemplo): {df['idcompraitem_construido'].iloc[0]}")
     
-    # =====================================================
-    # TRATAMENTO DE DUPLICATAS
-    # =====================================================
-    
     registros_antes = len(df)
     
     if 'data_hora_atualizacao_item' in df.columns:
-        # Converter para datetime
         df['data_hora_atualizacao_item'] = pd.to_datetime(
             df['data_hora_atualizacao_item'], 
             errors='coerce'
         )
         
-        # Ordenar por data (mais recente primeiro) e remover duplicatas
         df = df.sort_values('data_hora_atualizacao_item', ascending=False)
         df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
         
@@ -374,50 +483,31 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"Registros após deduplicação: {len(df)}")
     
-    # =====================================================
-    # MAPEAMENTO: CSV normalizado → Banco
-    # =====================================================
-    
     column_mapping = {
-        # PRIMARY KEY (construída, não do CSV)
         'idcompraitem_construido': 'idcompraitem',
-        
-        # Identificadores
         'id_compra': 'idcompra',
         'numero_item_compra': 'numeroitemcompra',
-        
-        # Item
         'codigo_item_catalogo': 'coditemcatalogo',
         'descricao_item': 'descricaodetalhada',
-        
-        # Quantidade e valores
         'quantidade': 'quantidadehomologada',
         'sigla_unidade_medida': 'unidademedida',
-        'nome_unidade_medida': 'unidademedida',  # fallback
+        'nome_unidade_medida': 'unidademedida',
         'preco_unitario': 'valorunitariohomologado',
         'percentual_maior_desconto': 'percentualdesconto',
-        
-        # Fornecedor
         'marca': 'marca',
         'ni_fornecedor': 'nifornecedor',
         'nome_fornecedor': 'nomefornecedor',
-        
-        # Órgão
         'codigo_uasg': 'unidadeorgaocodigounidade',
         'nome_uasg': 'unidadeorgaonomeunidade',
         'estado': 'unidadeorgaouf',
-        
-        # Datas
         'data_compra': 'datacompra',
         'data_hora_atualizacao_item': 'datahoraatualizacaoitem',
     }
     
-    # Construir dicionário de dados
     result_data = {}
     
     for csv_col, schema_col in column_mapping.items():
         if csv_col in df.columns:
-            # Evitar sobrescrever se já mapeado (prioridade para primeira ocorrência)
             if schema_col not in result_data or result_data[schema_col] is None:
                 result_data[schema_col] = convert_column_type(
                     df[csv_col],
@@ -428,7 +518,6 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
             if schema_col not in result_data:
                 logger.debug(f"⚠️  Coluna '{csv_col}' não encontrada no CSV")
     
-    # Adicionar colunas faltantes do schema (com None)
     for col in PRECOS_SCHEMA.keys():
         if col not in result_data:
             result_data[col] = [None] * len(df)
@@ -441,7 +530,6 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"✓ DataFrame final: {len(result_df)} registros, {len(result_df.columns)} colunas")
     
-    # Verificação de colunas NULL críticas
     colunas_criticas = ['quantidadehomologada', 'unidademedida', 'valorunitariohomologado']
     for col in colunas_criticas:
         null_count = result_df[col].isna().sum()
@@ -468,7 +556,6 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
         placeholders = ', '.join(['%s'] * len(columns))
         columns_str = ', '.join(columns)
         
-        # PRIMARY KEY é idcompraitem
         insert_query = f"""
             INSERT INTO precos_catalogo ({columns_str})
             VALUES ({placeholders})
@@ -513,34 +600,155 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
         if 'conn' in locals():
             conn.rollback()
             conn.close()
-        return False
+        raise DatabaseError(f"Falha ao inserir no banco: {e}")
 
 # =====================================================
 # PROCESSAMENTO DE CÓDIGO
 # =====================================================
 
-def process_single_code(codigo: str, tipo: str) -> bool:
-    """Processa um único código de catálogo"""
+def process_single_code(codigo: str, tipo: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Processa um único código de catálogo
+    
+    Returns:
+        tipo_erro pode ser: 'API', 'DATABASE', 'VALIDATION', None
+    """
     try:
         logger.info(f"--- Processando código: {codigo} ({tipo}) ---")
         
-        df_raw = fetch_all_pages(codigo, tipo)
+        # Busca na API
+        try:
+            df_raw = fetch_all_pages(codigo, tipo)
+        except APIError as e:
+            return (False, 'API', str(e))
         
         if df_raw is None or df_raw.empty:
             logger.warning(f"Sem dados para código {codigo}")
-            return False
+            return (False, 'VALIDATION', 'Nenhum dado retornado pela API')
         
-        df_clean = map_csv_to_schema(df_raw)
+        # Transformação
+        try:
+            df_clean = map_csv_to_schema(df_raw)
+        except DataValidationError as e:
+            return (False, 'VALIDATION', str(e))
         
-        success = load_precos_to_cockroach(df_clean)
-        
-        return success
+        # Carga no banco
+        try:
+            load_precos_to_cockroach(df_clean)
+            return (True, None, None)
+        except DatabaseError as e:
+            return (False, 'DATABASE', str(e))
         
     except Exception as e:
-        logger.error(f"Erro ao processar código {codigo}: {e}")
+        logger.error(f"Erro inesperado ao processar código {codigo}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return False
+        return (False, 'UNKNOWN', str(e))
+
+def process_code_with_retry(codigo: str, tipo: str) -> bool:
+    """
+    Processa código com retry para erros de API
+    
+    Returns:
+        True se sucesso, False caso contrário
+    """
+    success, error_type, error_msg = process_single_code(codigo, tipo)
+    
+    if success:
+        update_control_record(codigo, tipo, True)
+        return True
+    
+    # Se erro de API, tenta novamente após delay
+    if error_type == 'API':
+        logger.warning(f"⚠️  Erro de API para {codigo}, aguardando {CONFIG['API_ERROR_RETRY_DELAY']}s...")
+        time.sleep(CONFIG['API_ERROR_RETRY_DELAY'])
+        
+        success, error_type, error_msg = process_single_code(codigo, tipo)
+        
+        if success:
+            update_control_record(codigo, tipo, True)
+            return True
+    
+    # Se erro de banco, apenas loga e pula
+    if error_type == 'DATABASE':
+        global db_errors_log
+        db_errors_log.append({
+            'codigo': codigo,
+            'tipo': tipo,
+            'erro': error_msg,
+            'timestamp': datetime.now()
+        })
+        logger.error(f"❌ Erro de banco para {codigo} - pulando")
+    
+    # Atualiza controle com falha
+    update_control_record(codigo, tipo, False, f"[{error_type}] {error_msg}")
+    
+    return False
+
+# =====================================================
+# PROCESSAMENTO PARALELO
+# =====================================================
+
+def process_batch_parallel(batch: List[Tuple[str, str]]) -> Tuple[int, int, int]:
+    """
+    Processa lote de códigos em paralelo com stagger
+    
+    Returns:
+        (sucessos, falhas_api, falhas_outras)
+    """
+    sucessos = 0
+    falhas_api = 0
+    falhas_outras = 0
+    
+    with ThreadPoolExecutor(max_workers=CONFIG["PARALLEL_REQUESTS"]) as executor:
+        futures = {}
+        
+        for i, (codigo, tipo) in enumerate(batch):
+            # Stagger: aguarda 1 segundo entre cada submissão
+            if i > 0:
+                time.sleep(CONFIG["STAGGER_DELAY_SECONDS"])
+            
+            future = executor.submit(process_code_with_retry, codigo, tipo)
+            futures[future] = (codigo, tipo)
+            logger.info(f"🚀 Iniciada busca paralela: {codigo}")
+        
+        # Aguarda conclusão de todas
+        for future in as_completed(futures):
+            codigo, tipo = futures[future]
+            
+            try:
+                success = future.result()
+                
+                if success:
+                    sucessos += 1
+                    logger.info(f"✅ Concluído: {codigo}")
+                else:
+                    # Verifica tipo de erro no log de controle
+                    try:
+                        conn = get_db_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT ultimo_erro FROM precos_catalogo_controle WHERE codigo_catalogo = %s",
+                            (codigo,)
+                        )
+                        result = cursor.fetchone()
+                        cursor.close()
+                        conn.close()
+                        
+                        if result and result[0] and '[API]' in result[0]:
+                            falhas_api += 1
+                        else:
+                            falhas_outras += 1
+                    except:
+                        falhas_outras += 1
+                    
+                    logger.error(f"❌ Falhou: {codigo}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Exceção não capturada para {codigo}: {e}")
+                falhas_outras += 1
+    
+    return (sucessos, falhas_api, falhas_outras)
 
 # =====================================================
 # FUNÇÃO PRINCIPAL
@@ -548,16 +756,27 @@ def process_single_code(codigo: str, tipo: str) -> bool:
 
 def main():
     """Orquestração principal do pipeline de preços"""
+    global execution_start_time, should_stop, db_errors_log
     
+    execution_start_time = datetime.now()
+    should_stop = False
+    db_errors_log = []
+    
+    logger.info("="*70)
     if CONFIG["MODO_TESTE"]:
-        logger.info("="*60)
         logger.info("⚠️  EXECUTANDO EM MODO TESTE ⚠️")
         logger.info(f"Códigos: {CONFIG['TESTE_CODIGOS']}")
-        logger.info("="*60)
     else:
         logger.info("=== Pipeline de Preços de Catálogo (PRODUÇÃO) ===")
+    logger.info(f"Tempo limite: {CONFIG['EXECUTION_TIME_LIMIT_HOURS']} hora(s)")
+    logger.info(f"Processamento paralelo: {CONFIG['PARALLEL_REQUESTS']} requisições simultâneas")
+    logger.info("="*70)
     
     try:
+        # Cria tabela de controle
+        create_control_table()
+        
+        # Busca códigos pendentes
         pending_codes = get_pending_codes()
         
         if not pending_codes:
@@ -566,43 +785,67 @@ def main():
         
         total = len(pending_codes)
         processed = 0
-        failed = 0
-        consecutive_failures = 0
+        total_success = 0
+        total_failed = 0
+        consecutive_api_errors = 0
         
-        for i in range(0, len(pending_codes), CONFIG["BATCH_SIZE"]):
-            batch = pending_codes[i:i + CONFIG["BATCH_SIZE"]]
+        # Processa em lotes de 3
+        for i in range(0, len(pending_codes), CONFIG["PARALLEL_REQUESTS"]):
+            # Verifica tempo de execução
+            if not check_execution_time():
+                logger.warning("⏰ Encerrando execução por limite de tempo")
+                break
             
-            logger.info(f"\n>>> Lote {i//CONFIG['BATCH_SIZE'] + 1} ({len(batch)} códigos)")
-            logger.info(f"Falhas consecutivas: {consecutive_failures}/{CONFIG['MAX_CONSECUTIVE_FAILURES']}")
+            batch = pending_codes[i:i + CONFIG["PARALLEL_REQUESTS"]]
+            batch_num = (i // CONFIG["PARALLEL_REQUESTS"]) + 1
             
-            for codigo, tipo in batch:
-                if consecutive_failures >= CONFIG["MAX_CONSECUTIVE_FAILURES"]:
-                    logger.critical(f"🛑 LIMITE ATINGIDO ({CONFIG['MAX_CONSECUTIVE_FAILURES']})")
-                    return
-                
-                retry_count = 0
-                success = False
-                
-                while retry_count < CONFIG["MAX_RETRIES_PER_ITEM"] and not success:
-                    if retry_count > 0:
-                        time.sleep(CONFIG["RETRY_DELAY_SECONDS"])
-                    
-                    success = process_single_code(codigo, tipo)
-                    retry_count += 1
-                
-                if success:
-                    processed += 1
-                    consecutive_failures = 0
-                    logger.info(f"✅ Sucesso")
-                    time.sleep(CONFIG["SUCCESS_DELAY_SECONDS"])
-                else:
-                    failed += 1
-                    consecutive_failures += 1
-                    logger.error(f"❌ Falhou após {CONFIG['MAX_RETRIES_PER_ITEM']} tentativas")
+            logger.info(f"\n{'='*70}")
+            logger.info(f">>> LOTE {batch_num} - {len(batch)} códigos")
+            logger.info(f"Erros API consecutivos: {consecutive_api_errors}/{CONFIG['MAX_CONSECUTIVE_API_ERRORS']}")
+            logger.info(f"{'='*70}")
             
-            logger.info(f"Progresso: {processed}/{total}")
+            # Processa lote em paralelo
+            sucessos, falhas_api, falhas_outras = process_batch_parallel(batch)
+            
+            # Atualiza contadores
+            processed += len(batch)
+            total_success += sucessos
+            total_failed += (falhas_api + falhas_outras)
+            
+            # Gerencia contador de erros consecutivos de API
+            if falhas_api > 0:
+                consecutive_api_errors += falhas_api
+            else:
+                consecutive_api_errors = 0  # Reseta se teve algum sucesso
+            
+            # Verifica limite de erros consecutivos de API
+            if consecutive_api_errors >= CONFIG["MAX_CONSECUTIVE_API_ERRORS"]:
+                logger.critical(f"🛑 LIMITE DE ERROS DE API ATINGIDO ({CONFIG['MAX_CONSECUTIVE_API_ERRORS']})")
+                logger.critical("Possível problema sistêmico com a API - encerrando execução")
+                break
+            
+            logger.info(f"Lote {batch_num} concluído: {sucessos} sucessos, {falhas_api} falhas API, {falhas_outras} outras falhas")
         
-        logger.info("\n=== CONCLUÍDO ===")
+        # Relatório final
+        logger.info("\n" + "="*70)
+        logger.info("=== EXECUÇÃO CONCLUÍDA ===")
+        logger.info(f"Total processado: {processed}/{total}")
+        logger.info(f"Sucessos: {total_success}")
+        logger.info(f"Falhas: {total_failed}")
+        logger.info(f"Tempo de execução: {datetime.now() - execution_start_time}")
+        
+        # Log de erros de banco
+        if db_errors_log:
+            logger.warning(f"\n⚠️  ERROS DE BANCO DE DADOS ({len(db_errors_log)}):")
+            for err in db_errors_log:
+                logger.warning(f"  - {err['codigo']} ({err['tipo']}): {err['erro'][:100]}")
+        
+        logger.info("="*70)
+        
+    except DatabaseError as e:
+        logger.critical(f"❌ ERRO CRÍTICO DE BANCO: {e}")
+        logger.critical("Impossível continuar - verifique conexão e credenciais")
+        raise
         
     except Exception as e:
         logger.error(f"Erro fatal: {e}")
