@@ -4,14 +4,14 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from io import StringIO
+from datetime import datetime
+from google.auth import default
+import gspread
 import psycopg2
 from psycopg2.extras import execute_batch
-from typing import Dict, List, Optional, Tuple
-import re
+from typing import Dict, Optional, List, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.exceptions import Timeout, ConnectionError
+from threading import Lock
 
 # =====================================================
 # CONFIGURAÇÃO
@@ -22,24 +22,27 @@ CONFIG = {
         "COCKROACH_CONNECTION_STRING",
         "postgresql://sgc_admin:<password>@scary-quetzal-18026.j77.aws-us-east-1.cockroachlabs.cloud:26257/defaultdb?sslmode=require"
     ),
+    "SPREADSHEET_ID": os.getenv("SPREADSHEET_ID", "18P9l9_g-QE-DWsfRCokY18M5RLZe7mV-CWY1bfw6hlA"),
+    "SHEET_NAME": "idLista",
     "PNCP_BASE_URL": "https://dadosabertos.compras.gov.br",
     "ENDPOINTS": {
-        "MATERIAL": "modulo-pesquisa-preco/1.1_consultarMaterial_CSV",
-        "SERVICO": "modulo-pesquisa-preco/3.1_consultarServico_CSV"
+        "CONTRATACOES": "modulo-contratacoes/1.1_consultarContratacoes_PNCP_14133_Id",
+        "ITENS": "modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id",
+        "RESULTADOS": "modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id"
     },
-    "PAGE_SIZE": 200,
-    "PARALLEL_REQUESTS": 3,
-    "STAGGER_DELAY_SECONDS": 1,
-    "API_ERROR_RETRY_DELAY": 5,
-    "MAX_CONSECUTIVE_API_ERRORS": 6,
-    "MAX_ERRORS_PER_CODE": 10,
-    "EXECUTION_TIME_LIMIT_HOURS": 1,
-    "SCRIPT_VERSION": "v2.0.2",
-    
-    # ===== MODO TESTE =====
-    "MODO_TESTE": False,
-    "TESTE_CODIGOS": ["439495", "1333"],
+    "BATCH_SIZE": 50,
+    "SUCCESS_DELAY_SECONDS": 2,
+    "API_INTERVAL_SECONDS": 1,
+    "RETRY_DELAY_SECONDS": 5,
+    "MAX_RETRIES_PER_ITEM": 3,
+    "RETRY_DELAYS_SECONDS": {3: 5, 6: 10, 9: 60, 12: 300, 15: 600, 18: "CANCEL"}
 }
+
+# Status finalizados (case insensitive)
+STATUS_FINALIZADOS = {"homologado", "fracassado", "deserto", "anulado/revogado/cancelado"}
+
+# Lock para operações thread-safe
+db_lock = Lock()
 
 # =====================================================
 # LOGGING
@@ -52,111 +55,70 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =====================================================
-# VARIÁVEIS GLOBAIS DE CONTROLE
+# SCHEMAS (TODOS EM MINÚSCULAS)
 # =====================================================
 
-execution_start_time = None
-should_stop = False
-db_errors_log = []
-
-# =====================================================
-# SCHEMA PRECOS_CATALOGO
-# =====================================================
-
-PRECOS_SCHEMA = {
-    "idcompraitem": "STRING", 
+COMPRAS_SCHEMA = {
     "idcompra": "STRING",
-    "numeroitemcompra": "STRING",  
-    "coditemcatalogo": "STRING",
+    "numerocompra": "STRING",
+    "anocomprapncp": "INTEGER",
+    "codigomodalidade": "INTEGER",
+    "modalidadenome": "STRING",
+    "srp": "BOOLEAN",
     "unidadeorgaocodigounidade": "STRING",
     "unidadeorgaonomeunidade": "STRING",
-    "unidadeorgaouf": "STRING",
-    "descricaodetalhada": "STRING",
-    "quantidadehomologada": "STRING",
-    "unidademedida": "STRING",
-    "valorunitariohomologado": "STRING",
-    "percentualdesconto": "STRING",
-    "marca": "STRING",
-    "nifornecedor": "STRING",
-    "nomefornecedor": "STRING",
-    "datacompra": "STRING",
+    "unidadeorgaomunicipionome": "STRING",
+    "unidadeorgaoufsigla": "STRING",
+    "processo": "STRING",
+    "objetocompra": "STRING",
+    "valortotalestimado": "FLOAT",
+    "valortotalhomologado": "FLOAT",
+    "existeresultado": "BOOLEAN",
+    "dataaberturapropostapncp": "TIMESTAMP",
+    "contratacaoexcluida": "BOOLEAN",
+    "itenstotal": "INTEGER",
+    "itensresultados": "INTEGER",
+    "itenshomologados": "INTEGER",
+    "itensfracassados": "INTEGER",
+    "itensdesertos": "INTEGER",
+    "itensoutros": "INTEGER",
 }
 
-# =====================================================
-# CLASSES DE ERRO PERSONALIZADAS
-# =====================================================
+ITENS_SCHEMA = {
+    "idcompraitem": "STRING",
+    "idcompra": "STRING",
+    "numeroitemcompra": "INTEGER",
+    "numerogrupo": "INTEGER",
+    "materialouserviconome": "STRING",
+    "tipobeneficionome": "STRING",
+    "coditemcatalogo": "STRING",
+    "descricaoresumida": "STRING",
+    "descricaodetalhada": "STRING",
+    "quantidade": "FLOAT",
+    "unidademedida": "STRING",
+    "valorunitarioestimado": "FLOAT",
+    "valortotal": "FLOAT",
+    "temresultado": "BOOLEAN",
+    "situacaocompraitemnome": "STRING",
+    "cnpjfornecedor": "STRING",
+    "nomefornecedor": "STRING",
+}
 
-class APIError(Exception):
-    """Erro relacionado à API (timeout, bloqueio, rate limit)"""
-    pass
-
-class DatabaseError(Exception):
-    """Erro relacionado ao banco de dados"""
-    pass
-
-class DataValidationError(Exception):
-    """Erro de validação de dados (CSV malformado)"""
-    pass
-
-# =====================================================
-# FUNÇÕES AUXILIARES
-# =====================================================
-
-def normalizar_nome_coluna(nome: str) -> str:
-    """Converte CamelCase para snake_case"""
-    if not isinstance(nome, str):
-        return ''
-    s = nome.strip()
-    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
-    s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
-    return s.lower().strip('_')
-
-def convert_brazilian_number_to_decimal(value) -> Optional[str]:
-    """
-    Converte número brasileiro para formato decimal aceito pelo banco
-    
-    Exemplos:
-        "1,00" → "1.00"
-        "4.668,00" → "4668.00"
-        "19.760,00" → "19760.00"
-        "" → None
-        None → None
-    """
-    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
-        return None
-    
-    value_str = str(value).strip()
-    
-    # Remove pontos de milhar e troca vírgula por ponto
-    # Formato brasileiro: 1.234.567,89
-    # Formato americano: 1234567.89
-    value_str = value_str.replace('.', '')  # Remove pontos de milhar
-    value_str = value_str.replace(',', '.')  # Troca vírgula por ponto
-    
-    return value_str
-
-def convert_to_string_safe(value) -> Optional[str]:
-    """Converte valor para string de forma segura, retornando None para vazios"""
-    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
-        return None
-    return str(value).strip()
-
-def check_execution_time() -> bool:
-    """Verifica se o tempo de execução foi excedido"""
-    global execution_start_time, should_stop
-    
-    if should_stop:
-        return False
-    
-    elapsed = datetime.now() - execution_start_time
-    limit = timedelta(hours=CONFIG["EXECUTION_TIME_LIMIT_HOURS"])
-    
-    if elapsed >= limit:
-        logger.warning(f"⏰ Tempo de execução atingido: {elapsed} >= {limit}")
-        should_stop = True
-        return False
-    
-    return True
+RESULTADOS_SCHEMA = {
+    "idcompraitem": "STRING",
+    "idcompra": "STRING",
+    "nifornecedor": "STRING",
+    "tipopessoa": "STRING",
+    "nomerazaosocialfornecedor": "STRING",
+    "naturezajuridicanome": "STRING",
+    "portefornecedornome": "STRING",
+    "quantidadehomologada": "FLOAT",
+    "valorunitariohomologado": "FLOAT",
+    "valortotalhomologado": "FLOAT",
+    "percentualdesconto": "FLOAT",
+    "dataresultadopncp": "TIMESTAMP",
+    "aplicacaobeneficiomeepp": "BOOLEAN",
+}
 
 # =====================================================
 # CONEXÃO COM COCKROACHDB
@@ -169,385 +131,301 @@ def get_db_connection():
         return conn
     except Exception as e:
         logger.error(f"Erro ao conectar com CockroachDB: {e}")
-        raise DatabaseError(f"Falha na conexão: {e}")
+        raise
 
 # =====================================================
-# TABELA DE CONTROLE DE EXECUÇÃO
+# INICIALIZAÇÃO DO BANCO
 # =====================================================
 
-def create_control_table():
-    """Cria tabela de controle de execução se não existir"""
+def init_control_tables():
+    """Cria tabelas de controle se não existirem"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Tabela de controle para IDs de precos_catalogo já processados
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS precos_catalogo_processados (
+                idcompra STRING PRIMARY KEY,
+                data_processamento TIMESTAMP DEFAULT current_timestamp()
+            )
+        """)
+        
+        # Adicionar coluna 'origem' nas tabelas principais se não existir
+        for table in ['compras', 'itens_compra', 'resultados_itens']:
+            cursor.execute(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = '{table}' AND column_name = 'origem'
+            """)
+            
+            if not cursor.fetchone():
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN origem STRING DEFAULT 'SMS'")
+                logger.info(f"Coluna 'origem' adicionada à tabela {table}")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logger.info("Tabelas de controle inicializadas")
+        
+    except Exception as e:
+        logger.error(f"Erro ao inicializar tabelas de controle: {e}")
+        raise
+
+# =====================================================
+# FUNÇÕES DE CONSTRUÇÃO DA LISTA DE IDS
+# =====================================================
+
+def get_ids_from_sheets() -> List[str]:
+    """Extrai IDs do Google Sheets"""
+    try:
+        credentials, _ = default(scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'])
+        gc = gspread.authorize(credentials)
+        sheet = gc.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["SHEET_NAME"])
+        all_rows = sheet.get_all_values()
+        ids_list = [row[0].strip() for row in all_rows[1:] if row and row[0].strip()]
+        
+        logger.info(f"{len(ids_list)} IDs encontrados no Google Sheets")
+        return ids_list
+        
+    except Exception as e:
+        logger.error(f"Erro ao ler Google Sheets: {e}")
+        return []
+
+def check_if_compra_finalizada(idcompra: str, conn) -> bool:
+    """
+    Verifica se TODOS os itens de uma compra estão finalizados
+    Retorna True se finalizada (não deve buscar), False se pendente (deve buscar)
+    """
+    cursor = conn.cursor()
+    
+    # Buscar todos os idcompraitem e suas situações
+    cursor.execute("""
+        SELECT situacaocompraitemnome 
+        FROM itens_compra 
+        WHERE idcompra = %s
+    """, (idcompra,))
+    
+    rows = cursor.fetchall()
+    cursor.close()
+    
+    # Se não há itens no banco, deve buscar
+    if not rows:
+        return False
+    
+    # Verificar se TODOS estão finalizados
+    for (situacao,) in rows:
+        if situacao is None:
+            return False
+        if situacao.lower().strip() not in STATUS_FINALIZADOS:
+            return False
+    
+    # Todos os itens estão finalizados
+    return True
+
+def get_filtered_sheets_ids() -> List[Tuple[str, str]]:
+    """
+    Retorna lista de (idcompra, origem) do Google Sheets
+    Filtra apenas IDs que têm pelo menos 1 item não finalizado
+    """
+    ids_sheets = get_ids_from_sheets()
+    if not ids_sheets:
+        return []
+    
+    conn = get_db_connection()
+    filtered_ids = []
+    
+    for idcompra in ids_sheets:
+        if not check_if_compra_finalizada(idcompra, conn):
+            filtered_ids.append((idcompra, "SMS"))
+            logger.debug(f"ID {idcompra} incluído (tem itens pendentes)")
+        else:
+            logger.debug(f"ID {idcompra} pulado (todos itens finalizados)")
+    
+    conn.close()
+    
+    logger.info(f"{len(filtered_ids)} IDs do Sheets após filtro de finalização")
+    return filtered_ids
+
+def get_new_precos_catalogo_ids() -> List[Tuple[str, str]]:
+    """
+    Retorna lista de (idcompra, origem) de precos_catalogo
+    Apenas IDs que NUNCA foram processados
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Buscar IDs distintos de precos_catalogo que não estão processados
+        cursor.execute("""
+            SELECT DISTINCT pc.idcompra
+            FROM precos_catalogo pc
+            LEFT JOIN precos_catalogo_processados pcp 
+                ON pc.idcompra = pcp.idcompra
+            WHERE pcp.idcompra IS NULL
+        """)
+        
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        ids_list = [(row[0], "outras fontes") for row in rows]
+        logger.info(f"{len(ids_list)} IDs novos encontrados em precos_catalogo")
+        
+        return ids_list
+        
+    except Exception as e:
+        logger.error(f"Erro ao buscar IDs de precos_catalogo: {e}")
+        return []
+
+def get_idcompraitems_from_precos_catalogo(idcompra: str) -> Set[str]:
+    """Retorna set de idcompraitem presentes em precos_catalogo para um idcompra"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS precos_catalogo_controle (
-                codigo_catalogo STRING PRIMARY KEY,
-                tipo STRING NOT NULL,
-                tentativas_totais INT DEFAULT 0,
-                ultima_tentativa TIMESTAMP,
-                ultimo_erro TEXT,
-                ultimo_sucesso TIMESTAMP,
-                status STRING DEFAULT 'PENDENTE'
-            )
-        """)
+            SELECT DISTINCT idcompraitem 
+            FROM precos_catalogo 
+            WHERE idcompra = %s
+        """, (idcompra,))
         
-        conn.commit()
-        cursor.close()
-        conn.close()
-        logger.info("✓ Tabela de controle verificada/criada")
-        
-    except Exception as e:
-        logger.error(f"Erro ao criar tabela de controle: {e}")
-        raise DatabaseError(f"Falha ao criar tabela de controle: {e}")
-
-def update_control_record(codigo: str, tipo: str, success: bool, error_msg: Optional[str] = None):
-    """Atualiza registro de controle de execução"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        if success:
-            cursor.execute("""
-                INSERT INTO precos_catalogo_controle 
-                    (codigo_catalogo, tipo, tentativas_totais, ultima_tentativa, ultimo_sucesso, status)
-                VALUES (%s, %s, 1, NOW(), NOW(), 'SUCESSO')
-                ON CONFLICT (codigo_catalogo)
-                DO UPDATE SET
-                    tentativas_totais = precos_catalogo_controle.tentativas_totais + 1,
-                    ultima_tentativa = NOW(),
-                    ultimo_sucesso = NOW(),
-                    status = 'SUCESSO'
-            """, (codigo, tipo))
-        else:
-            cursor.execute("""
-                INSERT INTO precos_catalogo_controle 
-                    (codigo_catalogo, tipo, tentativas_totais, ultima_tentativa, ultimo_erro, status)
-                VALUES (%s, %s, 1, NOW(), %s, 'ERRO')
-                ON CONFLICT (codigo_catalogo)
-                DO UPDATE SET
-                    tentativas_totais = precos_catalogo_controle.tentativas_totais + 1,
-                    ultima_tentativa = NOW(),
-                    ultimo_erro = %s,
-                    status = 'ERRO'
-            """, (codigo, tipo, error_msg, error_msg))
-        
-        conn.commit()
+        rows = cursor.fetchall()
         cursor.close()
         conn.close()
         
+        return {row[0] for row in rows}
+        
     except Exception as e:
-        logger.error(f"Erro ao atualizar controle para código {codigo}: {e}")
+        logger.error(f"Erro ao buscar idcompraitems: {e}")
+        return set()
 
-# =====================================================
-# FUNÇÕES DE BUSCA DE CÓDIGOS
-# =====================================================
+def build_search_list() -> List[Tuple[str, str]]:
+    """
+    Constrói lista final de IDs para buscar
+    Retorna lista de tuplas (idcompra, origem)
+    """
+    logger.info("Construindo lista de IDs para buscar...")
+    
+    # 1. IDs do Google Sheets (filtrados por finalização)
+    sheets_ids = get_filtered_sheets_ids()
+    
+    # 2. IDs de precos_catalogo (não processados)
+    catalogo_ids = get_new_precos_catalogo_ids()
+    
+    # 3. Combinar listas
+    all_ids = sheets_ids + catalogo_ids
+    
+    # 4. Remover duplicatas mantendo a primeira ocorrência (prioriza SMS)
+    seen = set()
+    unique_ids = []
+    for idcompra, origem in all_ids:
+        if idcompra not in seen:
+            seen.add(idcompra)
+            unique_ids.append((idcompra, origem))
+    
+    logger.info(f"Lista final: {len(unique_ids)} IDs únicos para buscar")
+    logger.info(f"  - SMS: {sum(1 for _, o in unique_ids if o == 'SMS')}")
+    logger.info(f"  - Outras fontes: {sum(1 for _, o in unique_ids if o == 'outras fontes')}")
+    
+    return unique_ids
 
-def get_pending_codes() -> List[Tuple[str, str]]:
-    """Retorna lista de (codigo_catalogo, tipo) priorizando nunca processados"""
+def mark_catalogo_as_processed(idcompra: str):
+    """Marca um ID de precos_catalogo como processado"""
     try:
-        if CONFIG["MODO_TESTE"]:
-            logger.warning("⚠️  MODO TESTE ATIVADO ⚠️")
-            logger.warning(f"Processando apenas códigos: {CONFIG['TESTE_CODIGOS']}")
-            
+        with db_lock:
             conn = get_db_connection()
             cursor = conn.cursor()
             
             cursor.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'itens_compra' 
-                  AND column_name IN ('coditemcatalogo', 'codigoitemcatalogo')
-            """)
+                INSERT INTO precos_catalogo_processados (idcompra, data_processamento)
+                VALUES (%s, %s)
+                ON CONFLICT (idcompra) DO NOTHING
+            """, (idcompra, datetime.utcnow()))
             
-            result = cursor.fetchone()
-            col_itens = result[0] if result else 'coditemcatalogo'
-            
-            test_codes = []
-            for codigo in CONFIG["TESTE_CODIGOS"]:
-                cursor.execute(f"""
-                    SELECT DISTINCT LOWER(materialouserviconome)
-                    FROM itens_compra
-                    WHERE TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_itens}, '\.0+$', ''))) = %s
-                    LIMIT 1
-                """, (codigo,))
-                
-                result = cursor.fetchone()
-                if result:
-                    tipo_lower = result[0]
-                    tipo = 'MATERIAL' if 'material' in tipo_lower else 'SERVICO'
-                    test_codes.append((codigo, tipo))
-                else:
-                    test_codes.append((codigo, 'MATERIAL'))
-            
+            conn.commit()
             cursor.close()
             conn.close()
-            
-            logger.info(f"Total de códigos em MODO TESTE: {len(test_codes)}")
-            return test_codes
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'itens_compra' 
-              AND column_name IN ('coditemcatalogo', 'codigoitemcatalogo')
-        """)
-        
-        result_itens = cursor.fetchone()
-        
-        if not result_itens:
-            logger.error("Nenhuma coluna de código de catálogo encontrada")
-            cursor.close()
-            conn.close()
-            return []
-        
-        col_itens = result_itens[0]
-        
-        query = f"""
-        WITH codigos_itens AS (
-            SELECT DISTINCT 
-                TRIM(TRAILING '0' FROM TRIM(TRAILING '.' FROM REGEXP_REPLACE({col_itens}, '\.0+$', ''))) as codigo,
-                LOWER(materialouserviconome) as tipo_lower
-            FROM itens_compra
-            WHERE {col_itens} IS NOT NULL 
-              AND {col_itens} != ''
-              AND materialouserviconome IS NOT NULL
-        )
-        SELECT 
-            ci.codigo,
-            CASE 
-                WHEN ci.tipo_lower LIKE '%material%' THEN 'MATERIAL'
-                WHEN ci.tipo_lower LIKE '%servi%' THEN 'SERVICO'
-                ELSE 'MATERIAL'
-            END as tipo
-        FROM codigos_itens ci
-        LEFT JOIN precos_catalogo_controle ctrl ON ci.codigo = ctrl.codigo_catalogo
-        WHERE ci.codigo ~ '^[0-9]+$'
-          AND (ctrl.tentativas_totais IS NULL OR ctrl.tentativas_totais < {CONFIG['MAX_ERRORS_PER_CODE']})
-        ORDER BY 
-            CASE 
-                WHEN ctrl.codigo_catalogo IS NULL THEN 0
-                WHEN ctrl.status = 'ERRO' THEN 1
-                WHEN ctrl.status = 'SUCESSO' THEN 2
-                ELSE 3
-            END,
-            ctrl.ultima_tentativa ASC NULLS FIRST,
-            ci.codigo::INT
-        """
-        
-        cursor.execute(query)
-        results = cursor.fetchall()
-        
-        cursor.close()
-        conn.close()
-        
-        logger.info(f"Total de códigos para processar: {len(results)}")
-        return results
         
     except Exception as e:
-        logger.error(f"Erro ao buscar códigos pendentes: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise DatabaseError(f"Falha ao buscar códigos: {e}")
+        logger.error(f"Erro ao marcar ID {idcompra} como processado: {e}")
 
 # =====================================================
-# FUNÇÕES DE EXTRAÇÃO DA API
+# FUNÇÕES DE EXTRAÇÃO
 # =====================================================
 
-def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
-    """Busca todas as páginas de um código"""
+def get_pncp_data(endpoint_key: str, id_param: str) -> Optional[Dict]:
+    """Extrai dados da API PNCP usando query parameters"""
     try:
-        endpoint = CONFIG["ENDPOINTS"][tipo]
-        url = f"{CONFIG['PNCP_BASE_URL']}/{endpoint}"
+        url = f"{CONFIG['PNCP_BASE_URL']}/{CONFIG['ENDPOINTS'][endpoint_key]}"
+        params = {'tipo': 'idCompra', 'codigo': id_param}
         
-        all_data = []
-        pagina = 1
+        logger.info(f"Chamando: {url} com params: {params}")
         
-        while True:
-            params = {
-                'pagina': pagina,
-                'codigoItemCatalogo': codigo
-            }
-            
-            if tipo == "MATERIAL":
-                params['tamanhoPagina'] = CONFIG["PAGE_SIZE"]
-            
-            logger.info(f"Buscando código {codigo} ({tipo}) - Página {pagina}")
-            
-            try:
-                response = requests.get(url, params=params, timeout=30)
-                response.raise_for_status()
-            except (Timeout, ConnectionError) as e:
-                raise APIError(f"Timeout/ConnectionError na API: {e}")
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code in [429, 503]:
-                    raise APIError(f"API bloqueada/indisponível (HTTP {e.response.status_code})")
-                raise APIError(f"Erro HTTP na API: {e}")
-            
-            content = response.content.decode('utf-8-sig')
-            
-            if not content.strip():
-                break
-            
-            lines = content.strip().split('\n')
-            if lines and 'totalRegistros:' in lines[-1]:
-                lines = lines[:-1]
-            
-            if len(lines) <= 1:
-                break
-            
-            clean_csv = '\n'.join(lines)
-            
-            df_page = pd.read_csv(
-                StringIO(clean_csv),
-                sep=';',
-                encoding='utf-8',
-                on_bad_lines='warn',
-                engine='python',
-                dtype=str,
-                keep_default_na=False
-            )
-            
-            if df_page.empty:
-                break
-            
-            all_data.append(df_page)
-            
-            if len(df_page) < CONFIG["PAGE_SIZE"]:
-                break
-            
-            pagina += 1
-            time.sleep(1)
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
         
-        if not all_data:
-            logger.warning(f"Nenhum dado encontrado para código {codigo}")
+        if not response.content:
+            logger.warning(f"Resposta vazia para {endpoint_key} - ID {id_param}")
             return None
         
-        df_final = pd.concat(all_data, ignore_index=True)
-        logger.info(f"✓ Total de {len(df_final)} registros para código {codigo}")
+        return response.json()
         
-        return df_final
-        
-    except APIError:
-        raise
+    except requests.exceptions.HTTPError as http_err:
+        logger.error(f"Erro HTTP para ID {id_param}. Status: {http_err.response.status_code}")
+        logger.error(f"Resposta: {http_err.response.text}")
+        return None
     except Exception as e:
-        logger.error(f"Erro inesperado ao processar código {codigo}: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise DataValidationError(f"Erro ao processar dados: {e}")
+        logger.error(f"Erro ao acessar {endpoint_key}: {e}")
+        return None
 
 # =====================================================
 # FUNÇÕES DE TRANSFORMAÇÃO
 # =====================================================
 
-def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapeia colunas do CSV para o schema do banco"""
-    if df.empty:
-        return pd.DataFrame(columns=list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script'])
-    
-    logger.info(f"Registros no CSV original: {len(df)}")
-    logger.info(f"Total de colunas no CSV: {len(df.columns)}")
-    
-    # Normalização
-    df.columns = [normalizar_nome_coluna(col) for col in df.columns]
-    
-    # Validação de colunas obrigatórias
-    if 'id_compra' not in df.columns or 'numero_item_compra' not in df.columns:
-        logger.error("❌ Colunas obrigatórias 'id_compra' e/ou 'numero_item_compra' não encontradas")
-        logger.error(f"Colunas disponíveis: {df.columns.tolist()}")
-        raise DataValidationError("Colunas obrigatórias ausentes no CSV")
-    
-    # Construção do idcompraitem
-    df['idcompraitem_construido'] = (
-        df['id_compra'].astype(str).str.strip() + 
-        df['numero_item_compra'].astype(str).str.strip().str.zfill(5)
-    )
-    
-    logger.info(f"✓ idcompraitem construído (exemplo): {df['idcompraitem_construido'].iloc[0]}")
-    
-    # Tratamento de duplicatas
-    registros_antes = len(df)
-    
-    if 'data_hora_atualizacao_item' in df.columns:
-        df['data_hora_atualizacao_item'] = pd.to_datetime(
-            df['data_hora_atualizacao_item'], 
-            errors='coerce'
-        )
-        
-        df = df.sort_values('data_hora_atualizacao_item', ascending=False)
-        df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
-        
-        registros_removidos = registros_antes - len(df)
-        if registros_removidos > 0:
-            logger.warning(f"⚠️  {registros_removidos} duplicatas removidas")
-    else:
-        df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
-    
-    logger.info(f"Registros após deduplicação: {len(df)}")
-    
-    # =====================================================
-    # MAPEAMENTO COM CONVERSÃO NUMÉRICA
-    # =====================================================
-    column_mapping = {
-        'idcompraitem_construido': ('idcompraitem', 'string'),
-        'id_compra': ('idcompra', 'string'),
-        'numero_item_compra': ('numeroitemcompra', 'string'),
-        'codigo_item_catalogo': ('coditemcatalogo', 'string'),
-        'descricao_item': ('descricaodetalhada', 'string'),
-        'quantidade': ('quantidadehomologada', 'decimal'),  # ← CONVERSÃO NUMÉRICA
-        'sigla_unidade_medida': ('unidademedida', 'string'),
-        'preco_unitario': ('valorunitariohomologado', 'decimal'),  # ← CONVERSÃO NUMÉRICA
-        'percentual_maior_desconto': ('percentualdesconto', 'decimal'),  # ← CONVERSÃO NUMÉRICA
-        'marca': ('marca', 'string'),
-        'ni_fornecedor': ('nifornecedor', 'string'),
-        'nome_fornecedor': ('nomefornecedor', 'string'),
-        'codigo_uasg': ('unidadeorgaocodigounidade', 'string'),
-        'nome_uasg': ('unidadeorgaonomeunidade', 'string'),
-        'estado': ('unidadeorgaouf', 'string'),
-        'data_compra': ('datacompra', 'string'),
-    }
-    
-    result_data = {}
-    
-    for csv_col, (schema_col, col_type) in column_mapping.items():
-        if csv_col in df.columns:
-            if col_type == 'decimal':
-                # Converte números brasileiros para formato decimal
-                result_data[schema_col] = df[csv_col].apply(convert_brazilian_number_to_decimal)
-            else:
-                # String normal
-                result_data[schema_col] = df[csv_col].apply(convert_to_string_safe)
-            
-            not_null_count = result_data[schema_col].notna().sum()
-            logger.info(f"✓ Mapeado: {csv_col} → {schema_col} ({not_null_count}/{len(df)} não-nulos)")
+def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
+    """Converte tipos de dados"""
+    try:
+        if target_type == "STRING":
+            result = series.astype(str).replace(['nan', 'None', '<NA>', ''], None)
+            if result is not None and hasattr(result, 'str'):
+                result = result.str.replace(r'\.0$', '', regex=True)
+            return result
+        elif target_type == "INTEGER":
+            return pd.to_numeric(series, errors='coerce').astype('Int64')
+        elif target_type == "FLOAT":
+            return pd.to_numeric(series, errors='coerce')
+        elif target_type == "BOOLEAN":
+            return series.astype(bool)
+        elif target_type == "TIMESTAMP":
+            return pd.to_datetime(series, errors='coerce', utc=True)
         else:
-            if schema_col != 'marca':  # marca não existe no CSV, não precisa logar
-                logger.warning(f"❌ Coluna '{csv_col}' não encontrada no CSV")
-            result_data[schema_col] = [None] * len(df)
+            return series
+    except Exception as e:
+        logger.warning(f"Erro ao converter coluna: {e}")
+        return series
+
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza nomes de colunas removendo pontos e convertendo para minúsculas"""
+    df.columns = df.columns.str.replace('.', '', regex=False).str.lower()
+    return df
+
+def map_and_clean_dataframe(df: pd.DataFrame, schema: Dict[str, str]) -> pd.DataFrame:
+    """Mapeia e limpa DataFrame conforme schema"""
+    if df.empty:
+        return pd.DataFrame(columns=list(schema.keys()) + ['data_extracao', 'origem'])
     
-    # Adicionar colunas faltantes do schema
-    for col in PRECOS_SCHEMA.keys():
-        if col not in result_data:
-            result_data[col] = [None] * len(df)
+    df = normalize_column_names(df)
+    result_df = pd.DataFrame()
     
-    result_df = pd.DataFrame(result_data)
+    for col, dtype in schema.items():
+        if col in df.columns:
+            result_df[col] = convert_column_type(df[col], dtype)
+        else:
+            result_df[col] = None
+            logger.debug(f"Coluna {col} não encontrada no DataFrame")
     
     result_df['data_extracao'] = datetime.utcnow()
-    result_df['versao_script'] = CONFIG["SCRIPT_VERSION"]
-    
-    logger.info(f"✓ DataFrame final: {len(result_df)} registros, {len(result_df.columns)} colunas")
-    
-    # Verificação de colunas NULL críticas
-    colunas_criticas = ['quantidadehomologada', 'unidademedida', 'valorunitariohomologado']
-    for col in colunas_criticas:
-        null_count = result_df[col].isna().sum()
-        not_null_count = result_df[col].notna().sum()
-        if null_count > 0:
-            logger.warning(f"⚠️  Coluna '{col}': {not_null_count} preenchidos, {null_count} NULL")
     
     return result_df
 
@@ -555,277 +433,315 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
 # FUNÇÕES DE CARGA
 # =====================================================
 
-def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
-    """Carrega preços no CockroachDB"""
+def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, str], origem: str) -> bool:
+    """Carrega dados no CockroachDB com origem e UPSERT inteligente"""
     if df.empty:
-        logger.warning("DataFrame vazio - nada para inserir")
+        logger.warning(f"DataFrame vazio para tabela {table_name}")
         return False
     
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Adicionar coluna origem
+        df['origem'] = origem
         
-        columns = list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script']
-        placeholders = ', '.join(['%s'] * len(columns))
-        columns_str = ', '.join(columns)
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            columns = list(schema.keys()) + ['data_extracao', 'origem']
+            placeholders = ', '.join(['%s'] * len(columns))
+            columns_str = ', '.join(columns)
+            
+            conflict_column = "idcompraitem" if table_name != "compras" else "idcompra"
+            
+            # SET clauses que só atualizam se NULL ou diferente
+            set_clauses = ', '.join([
+                f'{col} = CASE WHEN {table_name}.{col} IS NULL OR {table_name}.{col} != EXCLUDED.{col} THEN EXCLUDED.{col} ELSE {table_name}.{col} END'
+                for col in columns if col != conflict_column
+            ])
+            
+            insert_query = f"""
+                INSERT INTO {table_name} ({columns_str})
+                VALUES ({placeholders})
+                ON CONFLICT ({conflict_column})
+                DO UPDATE SET {set_clauses}
+            """
+            
+            data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
+            
+            execute_batch(cursor, insert_query, data_tuples, page_size=1000)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
         
-        insert_query = f"""
-            INSERT INTO precos_catalogo ({columns_str})
-            VALUES ({placeholders})
-            ON CONFLICT (idcompraitem)
-            DO UPDATE SET 
-                idcompra = EXCLUDED.idcompra,
-                numeroitemcompra = EXCLUDED.numeroitemcompra,
-                coditemcatalogo = EXCLUDED.coditemcatalogo,
-                unidadeorgaocodigounidade = EXCLUDED.unidadeorgaocodigounidade,
-                unidadeorgaonomeunidade = EXCLUDED.unidadeorgaonomeunidade,
-                unidadeorgaouf = EXCLUDED.unidadeorgaouf,
-                descricaodetalhada = EXCLUDED.descricaodetalhada,
-                quantidadehomologada = EXCLUDED.quantidadehomologada,
-                unidademedida = EXCLUDED.unidademedida,
-                valorunitariohomologado = EXCLUDED.valorunitariohomologado,
-                percentualdesconto = EXCLUDED.percentualdesconto,
-                marca = EXCLUDED.marca,
-                nifornecedor = EXCLUDED.nifornecedor,
-                nomefornecedor = EXCLUDED.nomefornecedor,
-                datacompra = EXCLUDED.datacompra,
-                data_extracao = EXCLUDED.data_extracao,
-                versao_script = EXCLUDED.versao_script
-        """
-        
-        data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None, pd.NaT: None}).values]
-        
-        logger.info(f"Inserindo {len(data_tuples)} registros...")
-        execute_batch(cursor, insert_query, data_tuples, page_size=1000)
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
-        logger.info(f"✓ {len(df)} registros de preços inseridos/atualizados")
+        logger.info(f"✓ {len(df)} registros inseridos/atualizados em {table_name}")
         return True
         
     except Exception as e:
-        logger.error(f"Erro ao inserir preços: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Erro ao inserir em {table_name}: {e}")
         if 'conn' in locals():
             conn.rollback()
             conn.close()
-        raise DatabaseError(f"Falha ao inserir no banco: {e}")
+        return False
 
 # =====================================================
-# PROCESSAMENTO DE CÓDIGO
+# PROCESSAMENTO PARALELO COM RETRY
 # =====================================================
 
-def process_single_code(codigo: str, tipo: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Processa um único código de catálogo"""
+def call_api_with_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str], 
+                        table_name: str, origem: str, filter_items: Optional[Set[str]] = None) -> Tuple[str, bool, Optional[str]]:
+    """
+    Chama API com retry automático em caso de falha
+    Retorna: (endpoint_key, sucesso, mensagem_erro)
+    """
     try:
-        logger.info(f"--- Processando código: {codigo} ({tipo}) ---")
+        # Tentativa 1
+        data = get_pncp_data(endpoint_key, pncp_id)
         
-        try:
-            df_raw = fetch_all_pages(codigo, tipo)
-        except APIError as e:
-            return (False, 'API', str(e))
+        if not data or not data.get('resultado'):
+            logger.warning(f"Tentativa 1 falhou para {endpoint_key} - ID {pncp_id}. Aguardando {CONFIG['RETRY_DELAY_SECONDS']}s...")
+            time.sleep(CONFIG['RETRY_DELAY_SECONDS'])
+            
+            # Tentativa 2 (retry)
+            data = get_pncp_data(endpoint_key, pncp_id)
+            
+            if not data or not data.get('resultado'):
+                error_msg = f"Falha após retry: {endpoint_key} - ID {pncp_id}"
+                logger.error(error_msg)
+                return (endpoint_key, False, error_msg)
         
-        if df_raw is None or df_raw.empty:
-            logger.warning(f"Sem dados para código {codigo}")
-            return (False, 'VALIDATION', 'Nenhum dado retornado pela API')
+        # Sucesso na obtenção dos dados
+        df = pd.json_normalize(data.get('resultado', []))
+        df = map_and_clean_dataframe(df, schema)
         
-        try:
-            df_clean = map_csv_to_schema(df_raw)
-        except DataValidationError as e:
-            return (False, 'VALIDATION', str(e))
+        # Aplicar filtro se necessário
+        if filter_items is not None and not df.empty and 'idcompraitem' in df.columns:
+            df = df[df['idcompraitem'].isin(filter_items)]
+            logger.info(f"{endpoint_key} - Itens após filtro: {len(df)}")
         
-        try:
-            load_precos_to_cockroach(df_clean)
-            return (True, None, None)
-        except DatabaseError as e:
-            return (False, 'DATABASE', str(e))
+        if not df.empty:
+            success = load_data_to_cockroach(df, table_name, schema, origem)
+            if success:
+                logger.info(f"✓ {endpoint_key} processado com sucesso para ID {pncp_id}")
+                return (endpoint_key, True, None)
+            else:
+                error_msg = f"Falha ao salvar dados: {endpoint_key} - ID {pncp_id}"
+                return (endpoint_key, False, error_msg)
+        else:
+            logger.info(f"Sem dados para {endpoint_key} - ID {pncp_id}")
+            return (endpoint_key, True, None)  # Considera sucesso se não há dados
         
     except Exception as e:
-        logger.error(f"Erro inesperado ao processar código {codigo}: {e}")
+        error_msg = f"Exceção em {endpoint_key} - ID {pncp_id}: {str(e)}"
+        logger.error(error_msg)
+        return (endpoint_key, False, error_msg)
+
+def call_api_without_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str], 
+                           table_name: str, origem: str, filter_items: Optional[Set[str]] = None) -> Tuple[str, bool, Optional[str]]:
+    """
+    Chama API SEM retry (para segunda passagem)
+    Retorna: (endpoint_key, sucesso, mensagem_erro)
+    """
+    try:
+        data = get_pncp_data(endpoint_key, pncp_id)
+        
+        if not data or not data.get('resultado'):
+            error_msg = f"Falha na segunda passagem: {endpoint_key} - ID {pncp_id}"
+            logger.error(error_msg)
+            return (endpoint_key, False, error_msg)
+        
+        # Sucesso na obtenção dos dados
+        df = pd.json_normalize(data.get('resultado', []))
+        df = map_and_clean_dataframe(df, schema)
+        
+        # Aplicar filtro se necessário
+        if filter_items is not None and not df.empty and 'idcompraitem' in df.columns:
+            df = df[df['idcompraitem'].isin(filter_items)]
+        
+        if not df.empty:
+            success = load_data_to_cockroach(df, table_name, schema, origem)
+            if success:
+                logger.info(f"✓ {endpoint_key} processado com sucesso na 2ª passagem - ID {pncp_id}")
+                return (endpoint_key, True, None)
+            else:
+                error_msg = f"Falha ao salvar dados na 2ª passagem: {endpoint_key} - ID {pncp_id}"
+                return (endpoint_key, False, error_msg)
+        else:
+            return (endpoint_key, True, None)
+        
+    except Exception as e:
+        error_msg = f"Exceção na 2ª passagem - {endpoint_key} - ID {pncp_id}: {str(e)}"
+        logger.error(error_msg)
+        return (endpoint_key, False, error_msg)
+
+def process_single_id(pncp_id: str, origem: str, apis_to_process: Optional[List[str]] = None, 
+                      allow_retry: bool = True) -> Tuple[bool, List[str]]:
+    """
+    Processa um único ID do PNCP com chamadas paralelas
+    Retorna: (sucesso_total, lista_de_apis_falhadas)
+    """
+    try:
+        logger.info(f"Processando ID: {pncp_id} (origem: {origem})")
+        
+        # Determinar quais APIs processar
+        if apis_to_process is None:
+            apis_to_process = ["CONTRATACOES", "ITENS", "RESULTADOS"]
+        
+        # Determinar filtro de itens
+        filter_items = None
+        if origem == "outras fontes":
+            filter_items = get_idcompraitems_from_precos_catalogo(pncp_id)
+            if filter_items:
+                logger.info(f"Filtrando {len(filter_items)} idcompraitems de precos_catalogo")
+        
+        # Mapeamento de APIs para schemas e tabelas
+        api_config = {
+            "CONTRATACOES": (COMPRAS_SCHEMA, "compras", None),
+            "ITENS": (ITENS_SCHEMA, "itens_compra", filter_items),
+            "RESULTADOS": (RESULTADOS_SCHEMA, "resultados_itens", filter_items)
+        }
+        
+        failed_apis = []
+        
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = []
+            
+            # Disparar chamadas com intervalo de 1s
+            for i, api_key in enumerate(apis_to_process):
+                if i > 0:
+                    time.sleep(CONFIG['API_INTERVAL_SECONDS'])
+                
+                schema, table, filter_set = api_config[api_key]
+                future = executor.submit(
+                    call_api_with_retry if allow_retry else call_api_without_retry,
+                    api_key, pncp_id, schema, table, origem, filter_set
+                )
+                futures.append(future)
+            
+            # Aguardar todas as respostas
+            for future in as_completed(futures):
+                api_key, success, error_msg = future.result()
+                if not success:
+                    failed_apis.append(api_key)
+                    if error_msg:
+                        logger.error(error_msg)
+        
+        # Marcar como processado se origem = "outras fontes" e sucesso total
+        if origem == "outras fontes" and len(failed_apis) == 0:
+            mark_catalogo_as_processed(pncp_id)
+        
+        success_total = len(failed_apis) == 0
+        return (success_total, failed_apis)
+        
+    except Exception as e:
+        logger.error(f"Erro ao processar ID {pncp_id}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return (False, 'UNKNOWN', str(e))
-
-def process_code_with_retry(codigo: str, tipo: str) -> bool:
-    """Processa código com retry para erros de API"""
-    success, error_type, error_msg = process_single_code(codigo, tipo)
-    
-    if success:
-        update_control_record(codigo, tipo, True)
-        return True
-    
-    if error_type == 'API':
-        logger.warning(f"⚠️  Erro de API para {codigo}, aguardando {CONFIG['API_ERROR_RETRY_DELAY']}s...")
-        time.sleep(CONFIG['API_ERROR_RETRY_DELAY'])
-        
-        success, error_type, error_msg = process_single_code(codigo, tipo)
-        
-        if success:
-            update_control_record(codigo, tipo, True)
-            return True
-    
-    if error_type == 'DATABASE':
-        global db_errors_log
-        db_errors_log.append({
-            'codigo': codigo,
-            'tipo': tipo,
-            'erro': error_msg,
-            'timestamp': datetime.now()
-        })
-        logger.error(f"❌ Erro de banco para {codigo} - pulando")
-    
-    update_control_record(codigo, tipo, False, f"[{error_type}] {error_msg}")
-    
-    return False
-
-# =====================================================
-# PROCESSAMENTO PARALELO
-# =====================================================
-
-def process_batch_parallel(batch: List[Tuple[str, str]]) -> Tuple[int, int, int]:
-    """Processa lote de códigos em paralelo com stagger"""
-    sucessos = 0
-    falhas_api = 0
-    falhas_outras = 0
-    
-    with ThreadPoolExecutor(max_workers=CONFIG["PARALLEL_REQUESTS"]) as executor:
-        futures = {}
-        
-        for i, (codigo, tipo) in enumerate(batch):
-            if i > 0:
-                time.sleep(CONFIG["STAGGER_DELAY_SECONDS"])
-            
-            future = executor.submit(process_code_with_retry, codigo, tipo)
-            futures[future] = (codigo, tipo)
-            logger.info(f"🚀 Iniciada busca paralela: {codigo}")
-        
-        for future in as_completed(futures):
-            codigo, tipo = futures[future]
-            
-            try:
-                success = future.result()
-                
-                if success:
-                    sucessos += 1
-                    logger.info(f"✅ Concluído: {codigo}")
-                else:
-                    try:
-                        conn = get_db_connection()
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "SELECT ultimo_erro FROM precos_catalogo_controle WHERE codigo_catalogo = %s",
-                            (codigo,)
-                        )
-                        result = cursor.fetchone()
-                        cursor.close()
-                        conn.close()
-                        
-                        if result and result[0] and '[API]' in result[0]:
-                            falhas_api += 1
-                        else:
-                            falhas_outras += 1
-                    except:
-                        falhas_outras += 1
-                    
-                    logger.error(f"❌ Falhou: {codigo}")
-                    
-            except Exception as e:
-                logger.error(f"❌ Exceção não capturada para {codigo}: {e}")
-                falhas_outras += 1
-    
-    return (sucessos, falhas_api, falhas_outras)
+        return (False, apis_to_process if apis_to_process else ["CONTRATACOES", "ITENS", "RESULTADOS"])
 
 # =====================================================
 # FUNÇÃO PRINCIPAL
 # =====================================================
 
 def main():
-    """Orquestração principal do pipeline de preços"""
-    global execution_start_time, should_stop, db_errors_log
-    
-    execution_start_time = datetime.now()
-    should_stop = False
-    db_errors_log = []
-    
-    logger.info("="*70)
-    if CONFIG["MODO_TESTE"]:
-        logger.info("⚠️  EXECUTANDO EM MODO TESTE ⚠️")
-        logger.info(f"Códigos: {CONFIG['TESTE_CODIGOS']}")
-    else:
-        logger.info("=== Pipeline de Preços de Catálogo (PRODUÇÃO) ===")
-    logger.info(f"Tempo limite: {CONFIG['EXECUTION_TIME_LIMIT_HOURS']} hora(s)")
-    logger.info(f"Processamento paralelo: {CONFIG['PARALLEL_REQUESTS']} requisições simultâneas")
-    logger.info("="*70)
+    """Orquestração principal do ETL"""
+    logger.info("Iniciando ETL Pipeline PNCP → CockroachDB")
     
     try:
-        create_control_table()
-        pending_codes = get_pending_codes()
+        # 0. Inicializar tabelas de controle
+        init_control_tables()
         
-        if not pending_codes:
-            logger.info("Nenhum código pendente")
+        # 1. Construir lista de IDs para buscar
+        search_list = build_search_list()
+        
+        if not search_list:
+            logger.info("Nenhum ID para processar")
             return
         
-        total = len(pending_codes)
-        processed = 0
-        total_success = 0
-        total_failed = 0
-        consecutive_api_errors = 0
+        # Dicionário para rastrear falhas: {idcompra: (origem, [apis_falhadas])}
+        failed_ids = {}
         
-        for i in range(0, len(pending_codes), CONFIG["PARALLEL_REQUESTS"]):
-            if not check_execution_time():
-                logger.warning("⏰ Encerrando execução por limite de tempo")
-                break
-            
-            batch = pending_codes[i:i + CONFIG["PARALLEL_REQUESTS"]]
-            batch_num = (i // CONFIG["PARALLEL_REQUESTS"]) + 1
-            
-            logger.info(f"\n{'='*70}")
-            logger.info(f">>> LOTE {batch_num} - {len(batch)} códigos")
-            logger.info(f"Erros API consecutivos: {consecutive_api_errors}/{CONFIG['MAX_CONSECUTIVE_API_ERRORS']}")
-            logger.info(f"{'='*70}")
-            
-            sucessos, falhas_api, falhas_outras = process_batch_parallel(batch)
-            
-            processed += len(batch)
-            total_success += sucessos
-            total_failed += (falhas_api + falhas_outras)
-            
-            if falhas_api > 0:
-                consecutive_api_errors += falhas_api
-            else:
-                consecutive_api_errors = 0
-            
-            if consecutive_api_errors >= CONFIG["MAX_CONSECUTIVE_API_ERRORS"]:
-                logger.critical(f"🛑 LIMITE DE ERROS DE API ATINGIDO ({CONFIG['MAX_CONSECUTIVE_API_ERRORS']})")
-                logger.critical("Possível problema sistêmico com a API - encerrando execução")
-                break
-            
-            logger.info(f"Lote {batch_num} concluído: {sucessos} sucessos, {falhas_api} falhas API, {falhas_outras} outras falhas")
+        # 2. PRIMEIRA PASSAGEM - Processar todos os IDs
+        logger.info("=== INICIANDO PRIMEIRA PASSAGEM ===")
         
-        logger.info("\n" + "="*70)
-        logger.info("=== EXECUÇÃO CONCLUÍDA ===")
-        logger.info(f"Total processado: {processed}/{total}")
-        logger.info(f"Sucessos: {total_success}")
-        logger.info(f"Falhas: {total_failed}")
-        logger.info(f"Tempo de execução: {datetime.now() - execution_start_time}")
+        for idcompra, origem in search_list:
+            try:
+                success, failed_apis = process_single_id(idcompra, origem)
+                
+                if not success:
+                    failed_ids[idcompra] = (origem, failed_apis)
+                    logger.warning(f"ID {idcompra} teve falhas em: {', '.join(failed_apis)}")
+                else:
+                    logger.info(f"✓ ID {idcompra} processado com sucesso total")
+                
+                # Delay de 2s antes do próximo ID
+                time.sleep(CONFIG['SUCCESS_DELAY_SECONDS'])
+                
+            except Exception as e:
+                logger.error(f"Erro ao processar ID {idcompra}: {e}")
+                failed_ids[idcompra] = (origem, ["CONTRATACOES", "ITENS", "RESULTADOS"])
         
-        if db_errors_log:
-            logger.warning(f"\n⚠️  ERROS DE BANCO DE DADOS ({len(db_errors_log)}):")
-            for err in db_errors_log:
-                logger.warning(f"  - {err['codigo']} ({err['tipo']}): {err['erro'][:100]}")
+        # 3. SEGUNDA PASSAGEM - Reprocessar apenas APIs falhadas
+        if failed_ids:
+            logger.info(f"\n=== INICIANDO SEGUNDA PASSAGEM ===")
+            logger.info(f"Reprocessando {len(failed_ids)} IDs com falhas")
+            
+            final_errors = []
+            
+            for idcompra, (origem, failed_apis) in failed_ids.items():
+                try:
+                    logger.info(f"Reprocessando ID {idcompra} - APIs: {', '.join(failed_apis)}")
+                    
+                    success, still_failed = process_single_id(
+                        idcompra, 
+                        origem, 
+                        apis_to_process=failed_apis,
+                        allow_retry=False
+                    )
+                    
+                    if not success:
+                        error_entry = {
+                            'idcompra': idcompra,
+                            'origem': origem,
+                            'apis_falhadas': still_failed
+                        }
+                        final_errors.append(error_entry)
+                        logger.error(f"ERRO FINAL - ID: {idcompra}, APIs falhadas: {', '.join(still_failed)}, origem: {origem}")
+                    else:
+                        logger.info(f"✓ ID {idcompra} recuperado com sucesso na 2ª passagem")
+                    
+                    # Delay de 2s antes do próximo ID
+                    time.sleep(CONFIG['SUCCESS_DELAY_SECONDS'])
+                    
+                except Exception as e:
+                    logger.error(f"Erro na 2ª passagem para ID {idcompra}: {e}")
+                    final_errors.append({
+                        'idcompra': idcompra,
+                        'origem': origem,
+                        'apis_falhadas': failed_apis,
+                        'erro': str(e)
+                    })
+            
+            # Log final de erros
+            if final_errors:
+                logger.error("\n=== RESUMO DE ERROS FINAIS ===")
+                for error in final_errors:
+                               f"APIs com falha: {', '.join(error['apis_falhadas'])}")
         
-        logger.info("="*70)
+        # 4. Estatísticas finais
+        total_ids = len(search_list)
+        total_success = total_ids - len(failed_ids)
+        partial_success = len(failed_ids) - len(final_errors) if failed_ids else 0
+        total_failed = len(final_errors) if failed_ids else 0
         
-    except DatabaseError as e:
-        logger.critical(f"❌ ERRO CRÍTICO DE BANCO: {e}")
-        logger.critical("Impossível continuar - verifique conexão e credenciais")
-        raise
+        logger.info("\n=== ETL Pipeline concluído ===")
+        logger.info(f"Total de IDs: {total_ids}")
+        logger.info(f"Sucesso total (1ª passagem): {total_success}")
+        logger.info(f"Recuperados (2ª passagem): {partial_success}")
+        logger.info(f"Falhas finais: {total_failed}")
         
     except Exception as e:
-        logger.error(f"Erro fatal: {e}")
+        logger.error(f"Erro no pipeline principal: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise
