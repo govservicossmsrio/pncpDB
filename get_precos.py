@@ -34,7 +34,7 @@ CONFIG = {
     "MAX_CONSECUTIVE_API_ERRORS": 6,
     "MAX_ERRORS_PER_CODE": 10,
     "EXECUTION_TIME_LIMIT_HOURS": 1,
-    "SCRIPT_VERSION": "v2.0.0",
+    "SCRIPT_VERSION": "v2.0.1",
     
     # ===== MODO TESTE =====
     "MODO_TESTE": False,
@@ -60,26 +60,26 @@ should_stop = False
 db_errors_log = []
 
 # =====================================================
-# SCHEMA PRECOS_CATALOGO
+# SCHEMA PRECOS_CATALOGO (TODOS STRING - SEM CONVERSÃO)
 # =====================================================
 
 PRECOS_SCHEMA = {
     "idcompraitem": "STRING", 
     "idcompra": "STRING",
-    "numeroitemcompra": "INTEGER",  
+    "numeroitemcompra": "STRING",  
     "coditemcatalogo": "STRING",
     "unidadeorgaocodigounidade": "STRING",
     "unidadeorgaonomeunidade": "STRING",
     "unidadeorgaouf": "STRING",
     "descricaodetalhada": "STRING",
-    "quantidadehomologada": "FLOAT",
+    "quantidadehomologada": "STRING",
     "unidademedida": "STRING",
-    "valorunitariohomologado": "FLOAT",
-    "percentualdesconto": "FLOAT",
+    "valorunitariohomologado": "STRING",
+    "percentualdesconto": "STRING",
     "marca": "STRING",
     "nifornecedor": "STRING",
     "nomefornecedor": "STRING",
-    "datacompra": "DATE",
+    "datacompra": "STRING",
 }
 
 # =====================================================
@@ -378,7 +378,8 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
                 encoding='utf-8',
                 on_bad_lines='warn',
                 engine='python',
-                dtype=str
+                dtype=str,
+                keep_default_na=False
             )
             
             if df_page.empty:
@@ -413,42 +414,31 @@ def fetch_all_pages(codigo: str, tipo: str) -> Optional[pd.DataFrame]:
 # FUNÇÕES DE TRANSFORMAÇÃO
 # =====================================================
 
-def convert_column_type(series: pd.Series, target_type: str) -> pd.Series:
-    """Converte tipos de dados"""
-    try:
-        if target_type == "STRING":
-            result = series.astype(str).replace(['nan', 'None', '<NA>', ''], None)
-            if result is not None and hasattr(result, 'str'):
-                result = result.str.replace(r'\.0+$', '', regex=True)
-            return result
-        elif target_type == "INTEGER":
-            return pd.to_numeric(series, errors='coerce').astype('Int64')
-        elif target_type == "FLOAT":
-            return pd.to_numeric(series, errors='coerce')
-        elif target_type == "DATE":
-            return pd.to_datetime(series, errors='coerce').dt.date
-        elif target_type == "TIMESTAMP":
-            return pd.to_datetime(series, errors='coerce')
-        else:
-            return series
-    except Exception as e:
-        logger.warning(f"Erro ao converter coluna: {e}")
-        return series
+def convert_to_string_safe(value) -> Optional[str]:
+    """Converte valor para string de forma segura, retornando None para vazios"""
+    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
+        return None
+    return str(value).strip()
 
 def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapeia colunas do CSV para o schema do banco"""
+    """Mapeia colunas do CSV para o schema do banco (SEM CONVERSÃO DE TIPO)"""
     if df.empty:
         return pd.DataFrame(columns=list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script'])
     
     logger.info(f"Registros no CSV original: {len(df)}")
     logger.info(f"Total de colunas no CSV: {len(df.columns)}")
-    logger.info(f"Colunas originais (primeiras 10): {df.columns.tolist()[:10]}")
+    logger.info(f"Colunas completas: {df.columns.tolist()}")
     
     # Normalização
     df.columns = [normalizar_nome_coluna(col) for col in df.columns]
-    df = df.where(pd.notna(df), None)
     
-    logger.info(f"Colunas normalizadas (primeiras 10): {df.columns.tolist()[:10]}")
+    logger.info(f"Colunas normalizadas: {df.columns.tolist()}")
+    
+    # DEBUG: Verificar valores antes do mapeamento
+    if 'quantidade' in df.columns:
+        logger.info(f"DEBUG - quantidade (primeiros 3 valores): {df['quantidade'].head(3).tolist()}")
+    if 'preco_unitario' in df.columns:
+        logger.info(f"DEBUG - preco_unitario (primeiros 3 valores): {df['preco_unitario'].head(3).tolist()}")
     
     # Validação de colunas obrigatórias
     if 'id_compra' not in df.columns or 'numero_item_compra' not in df.columns:
@@ -460,15 +450,14 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     # CONSTRUÇÃO DO idcompraitem (PRIMARY KEY COMPOSTA)
     # =====================================================
     df['idcompraitem_construido'] = (
-        df['id_compra'].astype(str) + 
-        df['numero_item_compra'].astype(str).str.zfill(5)
+        df['id_compra'].astype(str).str.strip() + 
+        df['numero_item_compra'].astype(str).str.strip().str.zfill(5)
     )
     
     logger.info(f"✓ idcompraitem construído (exemplo): {df['idcompraitem_construido'].iloc[0]}")
     
     # =====================================================
     # TRATAMENTO DE DUPLICATAS
-    # (usa data_hora_atualizacao_item mas NÃO a salva no banco)
     # =====================================================
     registros_antes = len(df)
     
@@ -478,24 +467,20 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
             errors='coerce'
         )
         
-        # Ordena do mais recente para o mais antigo
         df = df.sort_values('data_hora_atualizacao_item', ascending=False)
-        
-        # Remove duplicatas mantendo o primeiro (mais recente)
         df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
         
         registros_removidos = registros_antes - len(df)
         if registros_removidos > 0:
             logger.warning(f"⚠️  {registros_removidos} duplicatas removidas (mantido registro mais recente)")
     else:
-        logger.warning("⚠️  Coluna 'data_hora_atualizacao_item' não encontrada - duplicatas não tratadas")
+        logger.warning("⚠️  Coluna 'data_hora_atualizacao_item' não encontrada")
         df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
     
     logger.info(f"Registros após deduplicação: {len(df)}")
     
     # =====================================================
-    # MAPEAMENTO: CSV normalizado → Banco
-    # (data_hora_atualizacao_item NÃO é mapeada)
+    # MAPEAMENTO: CSV normalizado → Banco (SEM CONVERSÃO)
     # =====================================================
     column_mapping = {
         'idcompraitem_construido': 'idcompraitem',
@@ -520,11 +505,12 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     for csv_col, schema_col in column_mapping.items():
         if csv_col in df.columns:
-            result_data[schema_col] = convert_column_type(
-                df[csv_col],
-                PRECOS_SCHEMA.get(schema_col, "STRING")
-            )
-            logger.debug(f"✓ Mapeado: {csv_col} → {schema_col}")
+            # Converte para string sem aplicar conversões de tipo
+            result_data[schema_col] = df[csv_col].apply(convert_to_string_safe)
+            
+            # Log para depuração
+            not_null_count = result_data[schema_col].notna().sum()
+            logger.info(f"✓ Mapeado: {csv_col} → {schema_col} ({not_null_count}/{len(df)} não-nulos)")
         else:
             logger.warning(f"❌ Coluna '{csv_col}' não encontrada no CSV")
             result_data[schema_col] = [None] * len(df)
@@ -533,7 +519,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     for col in PRECOS_SCHEMA.keys():
         if col not in result_data:
             result_data[col] = [None] * len(df)
-            logger.debug(f"⚠️  Coluna '{col}' preenchida com NULL (não encontrada no CSV)")
+            logger.debug(f"⚠️  Coluna '{col}' preenchida com NULL (não mapeada)")
     
     result_df = pd.DataFrame(result_data)
     
@@ -546,8 +532,9 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     colunas_criticas = ['quantidadehomologada', 'unidademedida', 'valorunitariohomologado']
     for col in colunas_criticas:
         null_count = result_df[col].isna().sum()
+        not_null_count = result_df[col].notna().sum()
         if null_count > 0:
-            logger.warning(f"⚠️  Coluna '{col}' tem {null_count} valores NULL de {len(result_df)} registros")
+            logger.warning(f"⚠️  Coluna '{col}': {not_null_count} preenchidos, {null_count} NULL")
     
     return result_df
 
@@ -593,9 +580,17 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
                 versao_script = EXCLUDED.versao_script
         """
         
-        data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
+        # Substitui NaN por None
+        data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None, pd.NaT: None}).values]
         
         logger.info(f"Inserindo {len(data_tuples)} registros...")
+        
+        # DEBUG: Log primeiro registro
+        if data_tuples:
+            logger.info(f"DEBUG - Primeiro registro a ser inserido:")
+            for i, col in enumerate(columns):
+                logger.info(f"  {col}: {data_tuples[0][i]}")
+        
         execute_batch(cursor, insert_query, data_tuples, page_size=1000)
         
         conn.commit()
@@ -623,7 +618,6 @@ def process_single_code(codigo: str, tipo: str) -> Tuple[bool, Optional[str], Op
     Processa um único código de catálogo
     
     Returns:
-        tipo_erro pode ser: 'API', 'DATABASE', 'VALIDATION', None
     """
     try:
         logger.info(f"--- Processando código: {codigo} ({tipo}) ---")
@@ -658,12 +652,7 @@ def process_single_code(codigo: str, tipo: str) -> Tuple[bool, Optional[str], Op
         return (False, 'UNKNOWN', str(e))
 
 def process_code_with_retry(codigo: str, tipo: str) -> bool:
-    """
-    Processa código com retry para erros de API
-    
-    Returns:
-        True se sucesso, False caso contrário
-    """
+    """Processa código com retry para erros de API"""
     success, error_type, error_msg = process_single_code(codigo, tipo)
     
     if success:
@@ -702,12 +691,7 @@ def process_code_with_retry(codigo: str, tipo: str) -> bool:
 # =====================================================
 
 def process_batch_parallel(batch: List[Tuple[str, str]]) -> Tuple[int, int, int]:
-    """
-    Processa lote de códigos em paralelo com stagger
-    
-    Returns:
-        (sucessos, falhas_api, falhas_outras)
-    """
+    """Processa lote de códigos em paralelo com stagger"""
     sucessos = 0
     falhas_api = 0
     falhas_outras = 0
@@ -716,7 +700,6 @@ def process_batch_parallel(batch: List[Tuple[str, str]]) -> Tuple[int, int, int]
         futures = {}
         
         for i, (codigo, tipo) in enumerate(batch):
-            # Stagger: aguarda 1 segundo entre cada submissão
             if i > 0:
                 time.sleep(CONFIG["STAGGER_DELAY_SECONDS"])
             
@@ -724,7 +707,6 @@ def process_batch_parallel(batch: List[Tuple[str, str]]) -> Tuple[int, int, int]
             futures[future] = (codigo, tipo)
             logger.info(f"🚀 Iniciada busca paralela: {codigo}")
         
-        # Aguarda conclusão de todas
         for future in as_completed(futures):
             codigo, tipo = futures[future]
             
@@ -735,7 +717,6 @@ def process_batch_parallel(batch: List[Tuple[str, str]]) -> Tuple[int, int, int]
                     sucessos += 1
                     logger.info(f"✅ Concluído: {codigo}")
                 else:
-                    # Verifica tipo de erro no log de controle
                     try:
                         conn = get_db_connection()
                         cursor = conn.cursor()
@@ -785,10 +766,7 @@ def main():
     logger.info("="*70)
     
     try:
-        # Cria tabela de controle
         create_control_table()
-        
-        # Busca códigos pendentes
         pending_codes = get_pending_codes()
         
         if not pending_codes:
@@ -801,9 +779,7 @@ def main():
         total_failed = 0
         consecutive_api_errors = 0
         
-        # Processa em lotes de 3
         for i in range(0, len(pending_codes), CONFIG["PARALLEL_REQUESTS"]):
-            # Verifica tempo de execução
             if not check_execution_time():
                 logger.warning("⏰ Encerrando execução por limite de tempo")
                 break
@@ -816,21 +792,17 @@ def main():
             logger.info(f"Erros API consecutivos: {consecutive_api_errors}/{CONFIG['MAX_CONSECUTIVE_API_ERRORS']}")
             logger.info(f"{'='*70}")
             
-            # Processa lote em paralelo
             sucessos, falhas_api, falhas_outras = process_batch_parallel(batch)
             
-            # Atualiza contadores
             processed += len(batch)
             total_success += sucessos
             total_failed += (falhas_api + falhas_outras)
             
-            # Gerencia contador de erros consecutivos de API
             if falhas_api > 0:
                 consecutive_api_errors += falhas_api
             else:
-                consecutive_api_errors = 0  # Reseta se teve algum sucesso
+                consecutive_api_errors = 0
             
-            # Verifica limite de erros consecutivos de API
             if consecutive_api_errors >= CONFIG["MAX_CONSECUTIVE_API_ERRORS"]:
                 logger.critical(f"🛑 LIMITE DE ERROS DE API ATINGIDO ({CONFIG['MAX_CONSECUTIVE_API_ERRORS']})")
                 logger.critical("Possível problema sistêmico com a API - encerrando execução")
@@ -838,7 +810,6 @@ def main():
             
             logger.info(f"Lote {batch_num} concluído: {sucessos} sucessos, {falhas_api} falhas API, {falhas_outras} outras falhas")
         
-        # Relatório final
         logger.info("\n" + "="*70)
         logger.info("=== EXECUÇÃO CONCLUÍDA ===")
         logger.info(f"Total processado: {processed}/{total}")
@@ -846,7 +817,6 @@ def main():
         logger.info(f"Falhas: {total_failed}")
         logger.info(f"Tempo de execução: {datetime.now() - execution_start_time}")
         
-        # Log de erros de banco
         if db_errors_log:
             logger.warning(f"\n⚠️  ERROS DE BANCO DE DADOS ({len(db_errors_log)}):")
             for err in db_errors_log:
