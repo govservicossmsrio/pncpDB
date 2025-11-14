@@ -723,10 +723,10 @@ def main():
                     })
             
             # Log final de erros
-            if final_errors:
+             if final_errors:
                 logger.error("\n=== RESUMO DE ERROS FINAIS ===")
                 for error in final_errors:
-                               f"APIs com falha: {', '.join(error['apis_falhadas'])}")
+                    apis_str = ', '.join(error['apis_falhadas'])
         
         # 4. Estatísticas finais
         total_ids = len(search_list)
