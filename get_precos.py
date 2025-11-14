@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Tuple
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.exceptions import Timeout, ConnectionError
-import signal
 
 # =====================================================
 # CONFIGURAÇÃO
@@ -81,7 +80,6 @@ PRECOS_SCHEMA = {
     "nifornecedor": "STRING",
     "nomefornecedor": "STRING",
     "datacompra": "DATE",
-    "datahoraatualizacaoitem": "TIMESTAMP",
 }
 
 # =====================================================
@@ -211,7 +209,6 @@ def update_control_record(codigo: str, tipo: str, success: bool, error_msg: Opti
         
     except Exception as e:
         logger.error(f"Erro ao atualizar controle para código {codigo}: {e}")
-        # Não propaga erro de controle para não atrapalhar fluxo principal
 
 # =====================================================
 # FUNÇÕES DE BUSCA DE CÓDIGOS
@@ -444,18 +441,24 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=list(PRECOS_SCHEMA.keys()) + ['data_extracao', 'versao_script'])
     
     logger.info(f"Registros no CSV original: {len(df)}")
+    logger.info(f"Total de colunas no CSV: {len(df.columns)}")
     logger.info(f"Colunas originais (primeiras 10): {df.columns.tolist()[:10]}")
     
+    # Normalização
     df.columns = [normalizar_nome_coluna(col) for col in df.columns]
     df = df.where(pd.notna(df), None)
     
     logger.info(f"Colunas normalizadas (primeiras 10): {df.columns.tolist()[:10]}")
     
+    # Validação de colunas obrigatórias
     if 'id_compra' not in df.columns or 'numero_item_compra' not in df.columns:
         logger.error("❌ Colunas obrigatórias 'id_compra' e/ou 'numero_item_compra' não encontradas")
         logger.error(f"Colunas disponíveis: {df.columns.tolist()}")
         raise DataValidationError("Colunas obrigatórias ausentes no CSV")
     
+    # =====================================================
+    # CONSTRUÇÃO DO idcompraitem (PRIMARY KEY COMPOSTA)
+    # =====================================================
     df['idcompraitem_construido'] = (
         df['id_compra'].astype(str) + 
         df['numero_item_compra'].astype(str).str.zfill(5)
@@ -463,6 +466,10 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"✓ idcompraitem construído (exemplo): {df['idcompraitem_construido'].iloc[0]}")
     
+    # =====================================================
+    # TRATAMENTO DE DUPLICATAS
+    # (usa data_hora_atualizacao_item mas NÃO a salva no banco)
+    # =====================================================
     registros_antes = len(df)
     
     if 'data_hora_atualizacao_item' in df.columns:
@@ -471,7 +478,10 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
             errors='coerce'
         )
         
+        # Ordena do mais recente para o mais antigo
         df = df.sort_values('data_hora_atualizacao_item', ascending=False)
+        
+        # Remove duplicatas mantendo o primeiro (mais recente)
         df = df.drop_duplicates(subset=['idcompraitem_construido'], keep='first')
         
         registros_removidos = registros_antes - len(df)
@@ -483,6 +493,10 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"Registros após deduplicação: {len(df)}")
     
+    # =====================================================
+    # MAPEAMENTO: CSV normalizado → Banco
+    # (data_hora_atualizacao_item NÃO é mapeada)
+    # =====================================================
     column_mapping = {
         'idcompraitem_construido': 'idcompraitem',
         'id_compra': 'idcompra',
@@ -491,7 +505,6 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         'descricao_item': 'descricaodetalhada',
         'quantidade': 'quantidadehomologada',
         'sigla_unidade_medida': 'unidademedida',
-        'nome_unidade_medida': 'unidademedida',
         'preco_unitario': 'valorunitariohomologado',
         'percentual_maior_desconto': 'percentualdesconto',
         'marca': 'marca',
@@ -501,23 +514,22 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         'nome_uasg': 'unidadeorgaonomeunidade',
         'estado': 'unidadeorgaouf',
         'data_compra': 'datacompra',
-        'data_hora_atualizacao_item': 'datahoraatualizacaoitem',
     }
     
     result_data = {}
     
     for csv_col, schema_col in column_mapping.items():
         if csv_col in df.columns:
-            if schema_col not in result_data or result_data[schema_col] is None:
-                result_data[schema_col] = convert_column_type(
-                    df[csv_col],
-                    PRECOS_SCHEMA.get(schema_col, "STRING")
-                )
-                logger.debug(f"✓ Mapeado: {csv_col} → {schema_col}")
+            result_data[schema_col] = convert_column_type(
+                df[csv_col],
+                PRECOS_SCHEMA.get(schema_col, "STRING")
+            )
+            logger.debug(f"✓ Mapeado: {csv_col} → {schema_col}")
         else:
-            if schema_col not in result_data:
-                logger.debug(f"⚠️  Coluna '{csv_col}' não encontrada no CSV")
+            logger.warning(f"❌ Coluna '{csv_col}' não encontrada no CSV")
+            result_data[schema_col] = [None] * len(df)
     
+    # Adicionar colunas faltantes do schema
     for col in PRECOS_SCHEMA.keys():
         if col not in result_data:
             result_data[col] = [None] * len(df)
@@ -530,6 +542,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"✓ DataFrame final: {len(result_df)} registros, {len(result_df.columns)} colunas")
     
+    # Verificação de colunas NULL críticas
     colunas_criticas = ['quantidadehomologada', 'unidademedida', 'valorunitariohomologado']
     for col in colunas_criticas:
         null_count = result_df[col].isna().sum()
@@ -576,7 +589,6 @@ def load_precos_to_cockroach(df: pd.DataFrame) -> bool:
                 nifornecedor = EXCLUDED.nifornecedor,
                 nomefornecedor = EXCLUDED.nomefornecedor,
                 datacompra = EXCLUDED.datacompra,
-                datahoraatualizacaoitem = EXCLUDED.datahoraatualizacaoitem,
                 data_extracao = EXCLUDED.data_extracao,
                 versao_script = EXCLUDED.versao_script
         """
@@ -844,14 +856,4 @@ def main():
         
     except DatabaseError as e:
         logger.critical(f"❌ ERRO CRÍTICO DE BANCO: {e}")
-        logger.critical("Impossível continuar - verifique conexão e credenciais")
-        raise
-        
-    except Exception as e:
-        logger.error(f"Erro fatal: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
-
-if __name__ == "__main__":
-    main()
+        logger.critical("Impossível continuar -
