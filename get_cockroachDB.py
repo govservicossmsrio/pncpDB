@@ -10,6 +10,8 @@ import gspread
 import psycopg2
 from psycopg2.extras import execute_batch
 from typing import Dict, Optional, List, Tuple, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 # =====================================================
 # CONFIGURAÇÃO
@@ -30,12 +32,17 @@ CONFIG = {
     },
     "BATCH_SIZE": 50,
     "SUCCESS_DELAY_SECONDS": 2,
+    "API_INTERVAL_SECONDS": 1,
+    "RETRY_DELAY_SECONDS": 5,
     "MAX_RETRIES_PER_ITEM": 3,
     "RETRY_DELAYS_SECONDS": {3: 5, 6: 10, 9: 60, 12: 300, 15: 600, 18: "CANCEL"}
 }
 
 # Status finalizados (case insensitive)
 STATUS_FINALIZADOS = {"homologado", "fracassado", "deserto", "anulado/revogado/cancelado"}
+
+# Lock para operações thread-safe
+db_lock = Lock()
 
 # =====================================================
 # LOGGING
@@ -326,18 +333,19 @@ def build_search_list() -> List[Tuple[str, str]]:
 def mark_catalogo_as_processed(idcompra: str):
     """Marca um ID de precos_catalogo como processado"""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO precos_catalogo_processados (idcompra, data_processamento)
-            VALUES (%s, %s)
-            ON CONFLICT (idcompra) DO NOTHING
-        """, (idcompra, datetime.utcnow()))
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO precos_catalogo_processados (idcompra, data_processamento)
+                VALUES (%s, %s)
+                ON CONFLICT (idcompra) DO NOTHING
+            """, (idcompra, datetime.utcnow()))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
         
     except Exception as e:
         logger.error(f"Erro ao marcar ID {idcompra} como processado: {e}")
@@ -435,35 +443,36 @@ def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, 
         # Adicionar coluna origem
         df['origem'] = origem
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        columns = list(schema.keys()) + ['data_extracao', 'origem']
-        placeholders = ', '.join(['%s'] * len(columns))
-        columns_str = ', '.join(columns)
-        
-        conflict_column = "idcompraitem" if table_name != "compras" else "idcompra"
-        
-        # SET clauses que só atualizam se NULL ou diferente
-        set_clauses = ', '.join([
-            f'{col} = CASE WHEN {table_name}.{col} IS NULL OR {table_name}.{col} != EXCLUDED.{col} THEN EXCLUDED.{col} ELSE {table_name}.{col} END'
-            for col in columns if col != conflict_column
-        ])
-        
-        insert_query = f"""
-            INSERT INTO {table_name} ({columns_str})
-            VALUES ({placeholders})
-            ON CONFLICT ({conflict_column})
-            DO UPDATE SET {set_clauses}
-        """
-        
-        data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
-        
-        execute_batch(cursor, insert_query, data_tuples, page_size=1000)
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            columns = list(schema.keys()) + ['data_extracao', 'origem']
+            placeholders = ', '.join(['%s'] * len(columns))
+            columns_str = ', '.join(columns)
+            
+            conflict_column = "idcompraitem" if table_name != "compras" else "idcompra"
+            
+            # SET clauses que só atualizam se NULL ou diferente
+            set_clauses = ', '.join([
+                f'{col} = CASE WHEN {table_name}.{col} IS NULL OR {table_name}.{col} != EXCLUDED.{col} THEN EXCLUDED.{col} ELSE {table_name}.{col} END'
+                for col in columns if col != conflict_column
+            ])
+            
+            insert_query = f"""
+                INSERT INTO {table_name} ({columns_str})
+                VALUES ({placeholders})
+                ON CONFLICT ({conflict_column})
+                DO UPDATE SET {set_clauses}
+            """
+            
+            data_tuples = [tuple(row) for row in df[columns].replace({np.nan: None}).values]
+            
+            execute_batch(cursor, insert_query, data_tuples, page_size=1000)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
         
         logger.info(f"✓ {len(df)} registros inseridos/atualizados em {table_name}")
         return True
@@ -476,78 +485,159 @@ def load_data_to_cockroach(df: pd.DataFrame, table_name: str, schema: Dict[str, 
         return False
 
 # =====================================================
-# PROCESSAMENTO DE IDS
+# PROCESSAMENTO PARALELO COM RETRY
 # =====================================================
 
-def process_single_id(pncp_id: str, origem: str) -> bool:
-    """Processa um único ID do PNCP com filtro de itens se origem = 'outras fontes'"""
+def call_api_with_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str], 
+                        table_name: str, origem: str, filter_items: Optional[Set[str]] = None) -> Tuple[str, bool, Optional[str]]:
+    """
+    Chama API com retry automático em caso de falha
+    Retorna: (endpoint_key, sucesso, mensagem_erro)
+    """
+    try:
+        # Tentativa 1
+        data = get_pncp_data(endpoint_key, pncp_id)
+        
+        if not data or not data.get('resultado'):
+            logger.warning(f"Tentativa 1 falhou para {endpoint_key} - ID {pncp_id}. Aguardando {CONFIG['RETRY_DELAY_SECONDS']}s...")
+            time.sleep(CONFIG['RETRY_DELAY_SECONDS'])
+            
+            # Tentativa 2 (retry)
+            data = get_pncp_data(endpoint_key, pncp_id)
+            
+            if not data or not data.get('resultado'):
+                error_msg = f"Falha após retry: {endpoint_key} - ID {pncp_id}"
+                logger.error(error_msg)
+                return (endpoint_key, False, error_msg)
+        
+        # Sucesso na obtenção dos dados
+        df = pd.json_normalize(data.get('resultado', []))
+        df = map_and_clean_dataframe(df, schema)
+        
+        # Aplicar filtro se necessário
+        if filter_items is not None and not df.empty and 'idcompraitem' in df.columns:
+            df = df[df['idcompraitem'].isin(filter_items)]
+            logger.info(f"{endpoint_key} - Itens após filtro: {len(df)}")
+        
+        if not df.empty:
+            success = load_data_to_cockroach(df, table_name, schema, origem)
+            if success:
+                logger.info(f"✓ {endpoint_key} processado com sucesso para ID {pncp_id}")
+                return (endpoint_key, True, None)
+            else:
+                error_msg = f"Falha ao salvar dados: {endpoint_key} - ID {pncp_id}"
+                return (endpoint_key, False, error_msg)
+        else:
+            logger.info(f"Sem dados para {endpoint_key} - ID {pncp_id}")
+            return (endpoint_key, True, None)  # Considera sucesso se não há dados
+        
+    except Exception as e:
+        error_msg = f"Exceção em {endpoint_key} - ID {pncp_id}: {str(e)}"
+        logger.error(error_msg)
+        return (endpoint_key, False, error_msg)
+
+def process_single_id(pncp_id: str, origem: str, apis_to_process: Optional[List[str]] = None, 
+                      allow_retry: bool = True) -> Tuple[bool, List[str]]:
+    """
+    Processa um único ID do PNCP com chamadas paralelas
+    Retorna: (sucesso_total, lista_de_apis_falhadas)
+    """
     try:
         logger.info(f"Processando ID: {pncp_id} (origem: {origem})")
         
-        # Determinar quais idcompraitems filtrar (se aplicável)
+        # Determinar quais APIs processar
+        if apis_to_process is None:
+            apis_to_process = ["CONTRATACOES", "ITENS", "RESULTADOS"]
+        
+        # Determinar filtro de itens
         filter_items = None
         if origem == "outras fontes":
             filter_items = get_idcompraitems_from_precos_catalogo(pncp_id)
-            logger.info(f"Filtrando {len(filter_items)} idcompraitems de precos_catalogo")
+            if filter_items:
+                logger.info(f"Filtrando {len(filter_items)} idcompraitems de precos_catalogo")
         
-        # 1. Extração de contratações (compras) - SEMPRE COMPLETO
-        contratacoes_data = get_pncp_data("CONTRATACOES", pncp_id)
+        # Mapeamento de APIs para schemas e tabelas
+        api_config = {
+            "CONTRATACOES": (COMPRAS_SCHEMA, "compras", None),
+            "ITENS": (ITENS_SCHEMA, "itens_compra", filter_items),
+            "RESULTADOS": (RESULTADOS_SCHEMA, "resultados_itens", filter_items)
+        }
         
-        if not contratacoes_data or not contratacoes_data.get('resultado'):
-            logger.warning(f"Sem dados de contratação para ID {pncp_id}")
-            return False
+        failed_apis = []
         
-        compras_df = pd.json_normalize(contratacoes_data.get('resultado', []))
-        compras_df = map_and_clean_dataframe(compras_df, COMPRAS_SCHEMA)
-        
-        if not load_data_to_cockroach(compras_df, "compras", COMPRAS_SCHEMA, origem):
-            return False
-        
-        # 2. Extração de itens - FILTRADO SE origem = "outras fontes"
-        itens_data = get_pncp_data("ITENS", pncp_id)
-        
-        if itens_data and itens_data.get('resultado'):
-            itens_df = pd.json_normalize(itens_data.get('resultado', []))
-            itens_df = map_and_clean_dataframe(itens_df, ITENS_SCHEMA)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = []
             
-            # Aplicar filtro se necessário
-            if filter_items is not None and not itens_df.empty:
-                itens_df = itens_df[itens_df['idcompraitem'].isin(filter_items)]
-                logger.info(f"Itens após filtro: {len(itens_df)}")
+            # Disparar chamadas com intervalo de 1s
+            for i, api_key in enumerate(apis_to_process):
+                if i > 0:
+                    time.sleep(CONFIG['API_INTERVAL_SECONDS'])
+                
+                schema, table, filter_set = api_config[api_key]
+                future = executor.submit(
+                    call_api_with_retry if allow_retry else call_api_without_retry,
+                    api_key, pncp_id, schema, table, origem, filter_set
+                )
+                futures.append(future)
             
-            if not itens_df.empty:
-                load_data_to_cockroach(itens_df, "itens_compra", ITENS_SCHEMA, origem)
-        else:
-            logger.info(f"Sem itens para ID {pncp_id}")
+            # Aguardar todas as respostas
+            for future in as_completed(futures):
+                api_key, success, error_msg = future.result()
+                if not success:
+                    failed_apis.append(api_key)
+                    if error_msg:
+                        logger.error(error_msg)
         
-        # 3. Extração de resultados - FILTRADO SE origem = "outras fontes"
-        resultados_data = get_pncp_data("RESULTADOS", pncp_id)
-        
-        if resultados_data and resultados_data.get('resultado'):
-            resultados_df = pd.json_normalize(resultados_data.get('resultado', []))
-            resultados_df = map_and_clean_dataframe(resultados_df, RESULTADOS_SCHEMA)
-            
-            # Aplicar filtro se necessário
-            if filter_items is not None and not resultados_df.empty:
-                resultados_df = resultados_df[resultados_df['idcompraitem'].isin(filter_items)]
-                logger.info(f"Resultados após filtro: {len(resultados_df)}")
-            
-            if not resultados_df.empty:
-                load_data_to_cockroach(resultados_df, "resultados_itens", RESULTADOS_SCHEMA, origem)
-        else:
-            logger.info(f"Sem resultados para ID {pncp_id}")
-        
-        # Marcar como processado se origem = "outras fontes"
-        if origem == "outras fontes":
+        # Marcar como processado se origem = "outras fontes" e sucesso total
+        if origem == "outras fontes" and len(failed_apis) == 0:
             mark_catalogo_as_processed(pncp_id)
         
-        return True
+        success_total = len(failed_apis) == 0
+        return (success_total, failed_apis)
         
     except Exception as e:
         logger.error(f"Erro ao processar ID {pncp_id}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return False
+        return (False, apis_to_process)
+
+def call_api_without_retry(endpoint_key: str, pncp_id: str, schema: Dict[str, str], 
+                           table_name: str, origem: str, filter_items: Optional[Set[str]] = None) -> Tuple[str, bool, Optional[str]]:
+    """
+    Chama API SEM retry (para segunda passagem)
+    Retorna: (endpoint_key, sucesso, mensagem_erro)
+    """
+    try:
+        data = get_pncp_data(endpoint_key, pncp_id)
+        
+        if not data or not data.get('resultado'):
+            error_msg = f"Falha na segunda passagem: {endpoint_key} - ID {pncp_id}"
+            logger.error(error_msg)
+            return (endpoint_key, False, error_msg)
+        
+        # Sucesso na obtenção dos dados
+        df = pd.json_normalize(data.get('resultado', []))
+        df = map_and_clean_dataframe(df, schema)
+        
+        # Aplicar filtro se necessário
+        if filter_items is not None and not df.empty and 'idcompraitem' in df.columns:
+            df = df[df['idcompraitem'].isin(filter_items)]
+        
+        if not df.empty:
+            success = load_data_to_cockroach(df, table_name, schema, origem)
+            if success:
+                logger.info(f"✓ {endpoint_key} processado com sucesso na 2ª passagem - ID {pncp_id}")
+                return (endpoint_key, True, None)
+            else:
+                error_msg = f"Falha ao salvar dados na 2ª passagem: {endpoint_key} - ID {pncp_id}"
+                return (endpoint_key, False, error_msg)
+        else:
+            return (endpoint_key, True, None)
+        
+    except Exception as e:
+        error_msg = f"Exceção na 2ª passagem - {endpoint_key} - ID {pncp_id}: {str(e)}"
+        logger.error(error_msg)
+        return (endpoint_key, False, error_msg)
 
 # =====================================================
 # FUNÇÃO PRINCIPAL
@@ -568,61 +658,87 @@ def main():
             logger.info("Nenhum ID para processar")
             return
         
-        # 2. Processar IDs em batches
-        retry_counts = {item[0]: 0 for item in search_list}
-        consecutive_failures = 0
+        # Dicionário para rastrear falhas: {idcompra: (origem, [apis_falhadas])}
+        failed_ids = {}
         
-        while search_list:
-            batch = search_list[:CONFIG["BATCH_SIZE"]]
-            if not batch:
-                break
-            
-            logger.info(f"--- Processando lote de {len(batch)} IDs ---")
-            batch_success = False
-            
-            for idcompra, origem in list(batch):
-                if (idcompra, origem) not in search_list:
-                    continue
+        # 2. PRIMEIRA PASSAGEM - Processar todos os IDs
+        logger.info("=== INICIANDO PRIMEIRA PASSAGEM ===")
+        
+        for idcompra, origem in search_list:
+            try:
+                success, failed_apis = process_single_id(idcompra, origem)
                 
-                retry_counts[idcompra] += 1
+                if not success:
+                    failed_ids[idcompra] = (origem, failed_apis)
+                    logger.warning(f"ID {idcompra} teve falhas em: {', '.join(failed_apis)}")
+                else:
+                    logger.info(f"✓ ID {idcompra} processado com sucesso total")
                 
+                # Delay de 2s antes do próximo ID
+                time.sleep(CONFIG['SUCCESS_DELAY_SECONDS'])
+                
+            except Exception as e:
+                logger.error(f"Erro ao processar ID {idcompra}: {e}")
+                failed_ids[idcompra] = (origem, ["CONTRATACOES", "ITENS", "RESULTADOS"])
+        
+        # 3. SEGUNDA PASSAGEM - Reprocessar apenas APIs falhadas
+        if failed_ids:
+            logger.info(f"\n=== INICIANDO SEGUNDA PASSAGEM ===")
+            logger.info(f"Reprocessando {len(failed_ids)} IDs com falhas")
+            
+            final_errors = []
+            
+            for idcompra, (origem, failed_apis) in failed_ids.items():
                 try:
-                    logger.info(f"ID: {idcompra} | Origem: {origem} (Tentativa {retry_counts[idcompra]})")
-                    success = process_single_id(idcompra, origem)
+                    logger.info(f"Reprocessando ID {idcompra} - APIs: {', '.join(failed_apis)}")
                     
-                    if success:
-                        search_list.remove((idcompra, origem))
-                        batch_success = True
-                        consecutive_failures = 0
-                        time.sleep(CONFIG["SUCCESS_DELAY_SECONDS"])
+                    success, still_failed = process_single_id(
+                        idcompra, 
+                        origem, 
+                        apis_to_process=failed_apis,
+                        allow_retry=False
+                    )
+                    
+                    if not success:
+                        error_entry = {
+                            'idcompra': idcompra,
+                            'origem': origem,
+                            'apis_falhadas': still_failed
+                        }
+                        final_errors.append(error_entry)
+                        logger.error(f"ERRO FINAL - ID: {idcompra}, APIs falhadas: {', '.join(still_failed)}, origem: {origem}")
                     else:
-                        if retry_counts[idcompra] >= CONFIG["MAX_RETRIES_PER_ITEM"]:
-                            logger.error(f"ID {idcompra} atingiu máximo de tentativas")
-                            search_list.remove((idcompra, origem))
-                            
+                        logger.info(f"✓ ID {idcompra} recuperado com sucesso na 2ª passagem")
+                    
+                    # Delay de 2s antes do próximo ID
+                    time.sleep(CONFIG['SUCCESS_DELAY_SECONDS'])
+                    
                 except Exception as e:
-                    logger.warning(f"Falha na tentativa {retry_counts[idcompra]} para {idcompra}: {e}")
-                    if retry_counts[idcompra] >= CONFIG["MAX_RETRIES_PER_ITEM"]:
-                        logger.error(f"ID {idcompra} descartado após {CONFIG['MAX_RETRIES_PER_ITEM']} falhas")
-                        search_list.remove((idcompra, origem))
+                    logger.error(f"Erro na 2ª passagem para ID {idcompra}: {e}")
+                    final_errors.append({
+                        'idcompra': idcompra,
+                        'origem': origem,
+                        'apis_falhadas': failed_apis,
+                        'erro': str(e)
+                    })
             
-            if not batch_success:
-                consecutive_failures += 1
-                logger.warning(f"Lote inteiro falhou. Falhas consecutivas: {consecutive_failures}")
-                
-                delay = CONFIG["RETRY_DELAYS_SECONDS"].get(consecutive_failures)
-                if delay == "CANCEL":
-                    logger.critical("Máximo de falhas consecutivas atingido. Abortando.")
-                    break
-                if delay:
-                    logger.info(f"Aguardando {delay}s antes da próxima tentativa...")
-                    time.sleep(delay)
+            # Log final de erros
+            if final_errors:
+                logger.error("\n=== RESUMO DE ERROS FINAIS ===")
+                for error in final_errors:
+                               f"APIs com falha: {', '.join(error['apis_falhadas'])}")
         
-        total_ids = len([item for item in build_search_list()])
-        processed = total_ids - len(search_list)
+        # 4. Estatísticas finais
+        total_ids = len(search_list)
+        total_success = total_ids - len(failed_ids)
+        partial_success = len(failed_ids) - len(final_errors) if failed_ids else 0
+        total_failed = len(final_errors) if failed_ids else 0
         
-        logger.info("--- ETL Pipeline concluído ---")
-        logger.info(f"Total processado: {processed}/{total_ids}")
+        logger.info("\n=== ETL Pipeline concluído ===")
+        logger.info(f"Total de IDs: {total_ids}")
+        logger.info(f"Sucesso total (1ª passagem): {total_success}")
+        logger.info(f"Recuperados (2ª passagem): {partial_success}")
+        logger.info(f"Falhas finais: {total_failed}")
         
     except Exception as e:
         logger.error(f"Erro no pipeline principal: {e}")
