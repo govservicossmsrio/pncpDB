@@ -27,7 +27,8 @@ jobs:
  
       - name: Write GCP credentials file
         run: |
-          echo "${{ secrets.GCP_SA_KEY }}" > gcp-key.json
+          echo '${{ secrets.GCP_SA_KEY }}' > gcp-key.json
+          cat gcp-key.json | jq empty  # Valida se é JSON válido
           echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp-key.json" >> $GITHUB_ENV
 
       - name: Run ETL Script
