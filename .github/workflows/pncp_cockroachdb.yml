@@ -8,6 +8,7 @@ on:
 jobs:
   run-etl:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     
     permissions:
       contents: 'read'
@@ -28,12 +29,21 @@ jobs:
       - name: Write GCP credentials file
         run: |
           echo '${{ secrets.GCP_SA_KEY }}' > gcp-key.json
-          cat gcp-key.json | jq empty  # Valida se é JSON válido
+          
+          # Validação do JSON
+          if ! jq empty gcp-key.json 2>/dev/null; then
+            echo "❌ JSON inválido"
+            cat gcp-key.json | head -c 200
+            exit 1
+          fi
+          
+          echo "✅ Credenciais GCP validadas"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp-key.json" >> $GITHUB_ENV
 
       - name: Run ETL Script
+        timeout-minutes: 40
         env:
           COCKROACH_CONNECTION_STRING: ${{ secrets.COCKROACH_CONNECTION_STRING }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
-          python get_cockroachDB.py
+          python -u get_cockroachDB.py
