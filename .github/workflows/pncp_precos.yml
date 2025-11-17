@@ -3,11 +3,12 @@ name: PNCP Preços
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'  # 02:00 AM todos os dias (UTC - ajuste conforme timezone)
+    - cron: '0 2 * * *'  # 02:00 AM todos os dias (UTC)
 
 jobs:
   run-precos-pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 90  # 1h30 (mais margem que o limite do script de 1h)
     
     permissions:
       contents: 'read'
@@ -20,23 +21,39 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
       
       - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
+      
+      - name: Write GCP credentials file
+        run: |
+          echo '${{ secrets.GCP_SA_KEY }}' > gcp-key.json
+          
+          # Validação do JSON
+          if ! jq empty gcp-key.json 2>/dev/null; then
+            echo "❌ JSON inválido"
+            cat gcp-key.json | head -c 200
+            exit 1
+          fi
+          
+          echo "✅ Credenciais GCP validadas"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp-key.json" >> $GITHUB_ENV
       
       - name: Verify Installation
         run: |
           pip list
           python -c "import psycopg2; print('psycopg2 OK')"
+          python -c "import gspread; print('gspread OK')"
+          python -c "import google.auth; print('google-auth OK')"
       
       - name: Run Preços Pipeline
+        timeout-minutes: 80
         env:
           COCKROACH_CONNECTION_STRING: ${{ secrets.COCKROACH_CONNECTION_STRING }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
-          python get_precos.py
+          python -u get_precos.py
       
       - name: Upload Logs (on failure)
         if: failure()
