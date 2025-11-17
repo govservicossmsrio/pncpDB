@@ -43,7 +43,7 @@ CONFIG = {
     "MAX_CONSECUTIVE_API_ERRORS": 6,
     "MAX_ERRORS_PER_CODE": 10,
     "EXECUTION_TIME_LIMIT_HOURS": 1,
-    "SCRIPT_VERSION": "v2.1.1",
+    "SCRIPT_VERSION": "v2.1.2",
     
     # ===== MODO TESTE =====
     "MODO_TESTE": False,
@@ -161,7 +161,6 @@ def initialize_sheets_tab():
         values = sheet.get_all_values()
         if not values or values[0] != ["cod_br", "idcompra", "status", "ultima_busca"]:
             logger.info("📝 Configurando cabeçalhos da planilha...")
-            # CORREÇÃO: Ordem correta dos argumentos (values primeiro)
             sheet.update(values=[["cod_br", "idcompra", "status", "ultima_busca"]], range_name='A1:D1')
             logger.info("✅ Cabeçalhos configurados")
         
@@ -169,7 +168,6 @@ def initialize_sheets_tab():
         
     except Exception as e:
         logger.error(f"❌ Erro ao inicializar aba Sheets: {e}")
-        # Não levanta exceção - processamento pode continuar sem Sheets
         return None
 
 def write_catalogo_status(codigo: str, idcompra_list: Optional[List[str]], status: str):
@@ -218,9 +216,9 @@ def write_catalogo_status(codigo: str, idcompra_list: Optional[List[str]], statu
         # Atualiza ou insere
         if row_index:
             logger.debug(f"🔄 Atualizando linha existente {row_index}...")
-            sheet.update_cell(row_index, 2, idcompra_display)  # Coluna B
-            sheet.update_cell(row_index, 3, status)            # Coluna C
-            sheet.update_cell(row_index, 4, dt)                # Coluna D
+            sheet.update_cell(row_index, 2, idcompra_display)
+            sheet.update_cell(row_index, 3, status)
+            sheet.update_cell(row_index, 4, dt)
             logger.info(f"✅ Status atualizado no Sheets para {codigo}")
         else:
             logger.debug(f"➕ Inserindo nova linha para código {codigo}...")
@@ -231,7 +229,6 @@ def write_catalogo_status(codigo: str, idcompra_list: Optional[List[str]], statu
         logger.error(f"❌ Erro ao escrever no Sheets para {codigo}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        # Não levanta exceção - processamento continua
 
 def populate_initial_codes():
     """Popula aba com todos os códigos que serão processados (apenas cod_br)"""
@@ -248,7 +245,7 @@ def populate_initial_codes():
         
         # Obter códigos já existentes
         values = sheet.get_all_values()
-        existing_codes = {row[0].strip() for row in values[1:] if row}  # Pula cabeçalho
+        existing_codes = {row[0].strip() for row in values[1:] if row}
         
         # Filtrar novos códigos
         new_codes = [(codigo, tipo) for codigo, tipo in pending_codes if codigo not in existing_codes]
@@ -269,7 +266,6 @@ def populate_initial_codes():
             
     except Exception as e:
         logger.error(f"❌ Erro ao popular códigos iniciais: {e}")
-        # Não levanta exceção - processamento continua
 
 # =====================================================
 # FUNÇÕES AUXILIARES
@@ -284,9 +280,9 @@ def normalizar_nome_coluna(nome: str) -> str:
     s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
 
-def convert_brazilian_number_to_decimal(value) -> Optional[str]:
+def convert_brazilian_number_to_string(value) -> Optional[str]:
     """
-    Converte número brasileiro para formato decimal aceito pelo banco
+    Converte número brasileiro para formato de ponto decimal, mas retorna STRING
     
     Exemplos:
         "1,00" → "1.00"
@@ -294,29 +290,6 @@ def convert_brazilian_number_to_decimal(value) -> Optional[str]:
         "19.760,00" → "19760.00"
         "" → None
         None → None
-    """
-    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
-        return None
-    
-    value_str = str(value).strip()
-    
-    # Trata strings que representam valores nulos
-    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>']:
-        return None
-    
-    # Remove pontos de milhar e troca vírgula por ponto
-    # Formato brasileiro: 1.234.567,89
-    # Formato americano: 1234567.89
-    value_str = value_str.replace('.', '')  # Remove pontos de milhar
-    value_str = value_str.replace(',', '.')  # Troca vírgula por ponto
-    
-    return value_str
-
-def convert_to_string_safe(value) -> Optional[str]:
-    """
-    Converte valor para string de forma segura, retornando None para vazios
-    
-    CORREÇÃO: Trata strings "null", "None", "nan" como None
     """
     if pd.isna(value) or value is None or value == '':
         return None
@@ -330,46 +303,16 @@ def convert_to_string_safe(value) -> Optional[str]:
     if value_str == '':
         return None
     
+    # Remove pontos de milhar e troca vírgula por ponto
+    value_str = value_str.replace('.', '')  # Remove pontos de milhar
+    value_str = value_str.replace(',', '.')  # Troca vírgula por ponto
+    
     return value_str
 
-def convert_to_integer_safe(value) -> Optional[int]:
+def convert_to_string_safe(value) -> Optional[str]:
     """
-    Converte valor para integer de forma segura, retornando None para inválidos
-    
-    NOVO: Função específica para campos INTEGER
-    """
-    if pd.isna(value) or value is None or value == '':
-        return None
-    
-    value_str = str(value).strip()
-    
-    # Trata strings que representam valores nulos
-    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>', '']:
-        return None
-    
-    # Remove decimais se for número float (ex: "123.0" -> "123")
-    if '.' in value_str:
-        try:
-            float_val = float(value_str)
-            if float_val.is_integer():
-                value_str = str(int(float_val))
-            else:
-                # Se tem decimal não-zero, tenta arredondar
-                value_str = str(round(float_val))
-        except:
-            return None
-    
-    try:
-        return int(value_str)
-    except (ValueError, TypeError):
-        logger.warning(f"⚠️ Não foi possível converter '{value_str}' para INTEGER - usando None")
-        return None
-
-def convert_to_date_safe(value) -> Optional[str]:
-    """
-    Converte valor para data de forma segura, retornando None para inválidos
-    
-    NOVO: Função específica para campos DATE
+    Converte valor para string de forma segura, retornando None para vazios
+    Remove .0 de números inteiros
     """
     if pd.isna(value) or value is None or value == '':
         return None
@@ -377,17 +320,17 @@ def convert_to_date_safe(value) -> Optional[str]:
     value_str = str(value).strip()
     
     # Trata strings que representam valores nulos
-    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>', '']:
+    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>']:
         return None
     
-    # Tenta converter para data
-    try:
-        date_obj = pd.to_datetime(value_str, errors='coerce')
-        if pd.isna(date_obj):
-            return None
-        return date_obj.strftime('%Y-%m-%d')
-    except:
+    if value_str == '':
         return None
+    
+    # Remove .0 de números inteiros (ex: "123.0" -> "123")
+    if value_str.endswith('.0') and value_str.replace('.', '').replace('-', '').isdigit():
+        value_str = value_str[:-2]
+    
+    return value_str
 
 def check_execution_time() -> bool:
     """Verifica se o tempo de execução foi excedido"""
@@ -768,43 +711,39 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"📊 Registros após deduplicação: {len(df)}")
     
     # =====================================================
-    # MAPEAMENTO COM CONVERSÃO CORRIGIDA
+    # MAPEAMENTO - TODOS OS CAMPOS COMO STRING
     # =====================================================
     logger.debug("🔄 Mapeando colunas para o schema do banco...")
     
     column_mapping = {
         'idcompraitem_construido': ('idcompraitem', 'string'),
         'id_compra': ('idcompra', 'string'),
-        'numero_item_compra': ('numeroitemcompra', 'integer'),  # ← CORRIGIDO
+        'numero_item_compra': ('numeroitemcompra', 'string'),
         'codigo_item_catalogo': ('coditemcatalogo', 'string'),
         'descricao_item': ('descricaodetalhada', 'string'),
-        'quantidade': ('quantidadehomologada', 'decimal'),
+        'quantidade': ('quantidadehomologada', 'numeric_string'),
         'sigla_unidade_medida': ('unidademedida', 'string'),
-        'preco_unitario': ('valorunitariohomologado', 'decimal'),
-        'percentual_maior_desconto': ('percentualdesconto', 'decimal'),
+        'preco_unitario': ('valorunitariohomologado', 'numeric_string'),
+        'percentual_maior_desconto': ('percentualdesconto', 'numeric_string'),
         'marca': ('marca', 'string'),
         'ni_fornecedor': ('nifornecedor', 'string'),
         'nome_fornecedor': ('nomefornecedor', 'string'),
         'codigo_uasg': ('unidadeorgaocodigounidade', 'string'),
         'nome_uasg': ('unidadeorgaonomeunidade', 'string'),
         'estado': ('unidadeorgaouf', 'string'),
-        'data_compra': ('datacompra', 'date'),  # ← CORRIGIDO
+        'data_compra': ('datacompra', 'string'),
     }
     
     result_data = {}
     
     for csv_col, (schema_col, col_type) in column_mapping.items():
         if csv_col in df.columns:
-            if col_type == 'decimal':
+            if col_type == 'numeric_string':
+                # Converte vírgula para ponto mas mantém como STRING
                 logger.debug(f"🔢 Convertendo campo numérico: {csv_col} → {schema_col}")
-                result_data[schema_col] = df[csv_col].apply(convert_brazilian_number_to_decimal)
-            elif col_type == 'integer':
-                logger.debug(f"🔢 Convertendo campo inteiro: {csv_col} → {schema_col}")
-                result_data[schema_col] = df[csv_col].apply(convert_to_integer_safe)
-            elif col_type == 'date':
-                logger.debug(f"📅 Convertendo campo data: {csv_col} → {schema_col}")
-                result_data[schema_col] = df[csv_col].apply(convert_to_date_safe)
+                result_data[schema_col] = df[csv_col].apply(convert_brazilian_number_to_string)
             else:
+                # String normal
                 result_data[schema_col] = df[csv_col].apply(convert_to_string_safe)
             
             not_null_count = result_data[schema_col].notna().sum()
