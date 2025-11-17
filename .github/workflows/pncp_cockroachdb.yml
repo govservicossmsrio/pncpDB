@@ -24,6 +24,12 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install -r requirements.txt
+
+      - name: Debug JSON content
+        run: |
+          echo "------ INÍCIO DO ARQUIVO ------"
+          cat gcp-key.json
+          echo "------ FIM DO ARQUIVO ------"
       
       - name: Write GCP credentials file
         run: |
