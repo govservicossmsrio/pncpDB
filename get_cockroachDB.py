@@ -1,17 +1,45 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+print("🔍 DEBUG: Script iniciado")
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+print("🔍 DEBUG: stdout configurado")
+
 import os
+print("🔍 DEBUG: os importado")
 import time
+print("🔍 DEBUG: time importado")
 import logging
+print("🔍 DEBUG: logging importado")
+
 import requests
+print("🔍 DEBUG: requests importado")
 import pandas as pd
+print("🔍 DEBUG: pandas importado")
 import numpy as np
+print("🔍 DEBUG: numpy importado")
 from datetime import datetime
-from google.auth import default
+print("🔍 DEBUG: datetime importado")
+
+print("🔍 DEBUG: Iniciando importação google.auth...")
+from google.oauth2 import service_account
+print("🔍 DEBUG: google.oauth2.service_account importado")
+
+print("🔍 DEBUG: Iniciando importação gspread...")
 import gspread
+print("🔍 DEBUG: gspread importado")
+
+print("🔍 DEBUG: Iniciando importação psycopg2...")
 import psycopg2
+print("🔍 DEBUG: psycopg2 importado")
 from psycopg2.extras import execute_batch
+print("🔍 DEBUG: psycopg2.extras importado")
+
 from typing import Dict, Optional, List, Tuple, Set
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+print("🔍 DEBUG: typing importado")
+
+print("✅ DEBUG: Todos os imports concluídos")
 
 # =====================================================
 # CONFIGURAÇÃO
@@ -35,18 +63,24 @@ CONFIG = {
     "SUCCESS_DELAY_SECONDS": 2,
     "API_INTERVAL_SECONDS": 1,
     "RETRY_DELAY_SECONDS": 5,
-    "MAX_RETRIES_PER_ITEM": 3
+    "MAX_RETRIES_PER_ITEM": 3,
+    "DB_TIMEOUT": 30,
+    "SHEETS_TIMEOUT": 60
 }
+
+print("🔍 DEBUG: CONFIG definido")
 
 STATUS_FINALIZADOS = {"homologado", "fracassado", "deserto", "anulado/revogado/cancelado"}
 
-db_lock = Lock()
-
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
+print("🔍 DEBUG: Logger configurado")
 
 # =====================================================
 # SCHEMAS
@@ -114,15 +148,23 @@ RESULTADOS_SCHEMA = {
     "aplicacaobeneficiomeepp": "BOOLEAN"
 }
 
+print("🔍 DEBUG: Schemas definidos")
+
 # =====================================================
 # CONEXÃO
 # =====================================================
 
 def get_db_connection():
+    logger.info("🔗 Conectando ao CockroachDB...")
     try:
-        return psycopg2.connect(CONFIG["COCKROACH_CONNECTION_STRING"])
+        conn = psycopg2.connect(
+            CONFIG["COCKROACH_CONNECTION_STRING"],
+            connect_timeout=CONFIG["DB_TIMEOUT"]
+        )
+        logger.info("✅ Conexão CockroachDB estabelecida")
+        return conn
     except Exception as e:
-        logger.error(f"Erro conexão DB: {e}")
+        logger.error(f"❌ Erro conexão DB: {e}")
         raise
 
 # =====================================================
@@ -130,9 +172,12 @@ def get_db_connection():
 # =====================================================
 
 def init_control_tables():
+    logger.info("🚀 Iniciando criação de tabelas de controle...")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        logger.info("📝 Criando tabela precos_catalogo_processados...")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS precos_catalogo_processados (
                 idcompra STRING PRIMARY KEY,
@@ -140,18 +185,23 @@ def init_control_tables():
                 data_processamento TIMESTAMP DEFAULT current_timestamp()
             )
         """)
+        
         for table in ['compras', 'itens_compra', 'resultados_itens']:
+            logger.info(f"🔍 Verificando coluna 'origem' na tabela {table}...")
             cursor.execute(f"""
                 SELECT column_name FROM information_schema.columns
                 WHERE table_name = '{table}' AND column_name = 'origem'
             """)
             if not cursor.fetchone():
+                logger.info(f"➕ Adicionando coluna 'origem' em {table}...")
                 cursor.execute(f"ALTER TABLE {table} ADD COLUMN origem STRING DEFAULT 'SMS'")
+        
         conn.commit()
         cursor.close()
         conn.close()
+        logger.info("✅ Tabelas de controle inicializadas com sucesso")
     except Exception as e:
-        logger.error(f"Erro inicialização: {e}")
+        logger.error(f"❌ Erro inicialização: {e}")
         raise
 
 # =====================================================
@@ -159,11 +209,34 @@ def init_control_tables():
 # =====================================================
 
 def get_sheets_client():
-    credentials, _ = default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return gspread.authorize(credentials)
+    logger.info("🔐 Autenticando Google Sheets...")
+    try:
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        logger.info(f"📄 Arquivo de credenciais: {creds_path}")
+        
+        if not creds_path or not os.path.exists(creds_path):
+            raise ValueError(f"Arquivo de credenciais não encontrado: {creds_path}")
+        
+        logger.info("🔑 Carregando credenciais do arquivo...")
+        credentials = service_account.Credentials.from_service_account_file(
+            creds_path,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        
+        logger.info("🔗 Autorizando cliente gspread...")
+        client = gspread.authorize(credentials)
+        logger.info("✅ Autenticação Google Sheets concluída")
+        return client
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao inicializar Google Sheets: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
 
 def write_sms_status(idcompra: str, status: str, dt: str):
     try:
+        logger.info(f"📊 Atualizando status SMS para {idcompra}...")
         gc = get_sheets_client()
         sheet = gc.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["SHEET_NAME"])
         values = sheet.get_all_values()
@@ -171,12 +244,14 @@ def write_sms_status(idcompra: str, status: str, dt: str):
             if values[i][0].strip() == idcompra:
                 sheet.update_cell(i+1, 4, status)
                 sheet.update_cell(i+1, 5, dt)
+                logger.info(f"✅ Status SMS atualizado para {idcompra}")
                 return
     except Exception as e:
-        logger.error(f"Erro escrita SMS sheets: {e}")
+        logger.error(f"❌ Erro escrita SMS sheets: {e}")
 
 def write_outros_status(idcompra: str, modalidade: str, lic: str, status: str, dt: str):
     try:
+        logger.info(f"📊 Atualizando status OUTROS para {idcompra}...")
         gc = get_sheets_client()
         sheet = gc.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["OUTROS_SHEET"])
         values = sheet.get_all_values()
@@ -190,20 +265,25 @@ def write_outros_status(idcompra: str, modalidade: str, lic: str, status: str, d
                 break
         if not found:
             sheet.append_row([idcompra, lic, modalidade, status, dt])
+        logger.info(f"✅ Status OUTROS atualizado para {idcompra}")
     except Exception as e:
-        logger.error(f"Erro escrita OUTROS sheets: {e}")
+        logger.error(f"❌ Erro escrita OUTROS sheets: {e}")
 
 # =====================================================
 # IDCOMPRA – FILTROS E OBTENÇÃO
 # =====================================================
 
 def get_ids_from_sheets():
+    logger.info("📋 Obtendo IDs da planilha...")
     try:
         gc = get_sheets_client()
         sheet = gc.open_by_key(CONFIG["SPREADSHEET_ID"]).worksheet(CONFIG["SHEET_NAME"])
         rows = sheet.get_all_values()
-        return [row[0].strip() for row in rows[1:] if row and row[0].strip()]
-    except:
+        ids = [row[0].strip() for row in rows[1:] if row and row[0].strip()]
+        logger.info(f"✅ {len(ids)} IDs encontrados na planilha")
+        return ids
+    except Exception as e:
+        logger.error(f"❌ Erro ao obter IDs da planilha: {e}")
         return []
 
 def check_if_compra_finalizada(idcompra, conn):
@@ -219,6 +299,7 @@ def check_if_compra_finalizada(idcompra, conn):
     return True
 
 def get_filtered_sheets_ids():
+    logger.info("🔍 Filtrando IDs da planilha...")
     ids = get_ids_from_sheets()
     conn = get_db_connection()
     out = []
@@ -226,9 +307,11 @@ def get_filtered_sheets_ids():
         if not check_if_compra_finalizada(idc, conn):
             out.append((idc, "SMS"))
     conn.close()
+    logger.info(f"✅ {len(out)} IDs SMS filtrados")
     return out
 
 def get_new_precos_catalogo_ids():
+    logger.info("🔍 Obtendo IDs de preços catálogo...")
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -239,13 +322,16 @@ def get_new_precos_catalogo_ids():
         rows = cur.fetchall()
         cur.close()
         conn.close()
-    except:
+    except Exception as e:
+        logger.error(f"❌ Erro ao obter IDs catálogo: {e}")
         return []
+    
     ids = [r[0] for r in rows]
     filtered = []
     for x in ids:
         if len(x) >= 9 and x[-9] == "9":
             filtered.append((x, "outras fontes"))
+    logger.info(f"✅ {len(filtered)} IDs catálogo filtrados")
     return filtered
 
 def get_idcompraitems_from_precos_catalogo(idc):
@@ -280,12 +366,16 @@ def get_pncp_data(endpoint_key, id_param):
     try:
         url = f"{CONFIG['PNCP_BASE_URL']}/{CONFIG['ENDPOINTS'][endpoint_key]}"
         params = {'tipo': 'idCompra', 'codigo': id_param}
+        logger.info(f"🌐 Consultando API PNCP: {endpoint_key} para {id_param}")
         r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
         if not r.content:
+            logger.warning(f"⚠️ Resposta vazia da API para {id_param}")
             return None
+        logger.info(f"✅ Dados obtidos da API: {endpoint_key}")
         return r.json()
-    except:
+    except Exception as e:
+        logger.error(f"❌ Erro API {endpoint_key}: {e}")
         return None
 
 # =====================================================
@@ -334,8 +424,11 @@ def map_and_clean_dataframe(df, schema):
 
 def load_data_to_cockroach(df, table, schema, origem):
     if df.empty:
+        logger.info(f"⏭️ DataFrame vazio, pulando insert em {table}")
         return True
+    
     try:
+        logger.info(f"💾 Inserindo {len(df)} registros em {table}...")
         df['origem'] = origem
         conn = get_db_connection()
         cur = conn.cursor()
@@ -350,9 +443,10 @@ def load_data_to_cockroach(df, table, schema, origem):
         conn.commit()
         cur.close()
         conn.close()
+        logger.info(f"✅ Dados inseridos em {table} com sucesso")
         return True
     except Exception as e:
-        logger.error(f"Erro load {table}: {e}")
+        logger.error(f"❌ Erro load {table}: {e}")
         return False
 
 # =====================================================
@@ -362,6 +456,7 @@ def load_data_to_cockroach(df, table, schema, origem):
 def process_api(endpoint_key, pncp_id, schema, table, origem, filter_items, retry=True):
     data = get_pncp_data(endpoint_key, pncp_id)
     if (not data or not data.get("resultado")) and retry:
+        logger.info(f"🔄 Tentando novamente {endpoint_key}...")
         time.sleep(CONFIG["RETRY_DELAY_SECONDS"])
         data = get_pncp_data(endpoint_key, pncp_id)
     if not data or not data.get("resultado"):
@@ -378,6 +473,10 @@ def process_api(endpoint_key, pncp_id, schema, table, origem, filter_items, retr
     return True, None
 
 def process_single_id(pncp_id, origem):
+    logger.info(f"{'='*60}")
+    logger.info(f"🔄 Processando: {pncp_id} ({origem})")
+    logger.info(f"{'='*60}")
+    
     filter_items = get_idcompraitems_from_precos_catalogo(pncp_id) if origem == "outras fontes" else None
     errors = []
     results = {}
@@ -413,6 +512,7 @@ def process_single_id(pncp_id, origem):
         sucesso_total = results["CONTRATACOES"] and results["ITENS"]
         mark_catalogo_processed(pncp_id, sucesso_total)
 
+    logger.info(f"✅ Processamento de {pncp_id} concluído: {status}")
     return True
 
 # =====================================================
@@ -420,22 +520,53 @@ def process_single_id(pncp_id, origem):
 # =====================================================
 
 def main():
-    init_control_tables()
+    print("🔍 DEBUG: Função main() iniciada")
+    logger.info("="*80)
+    logger.info("🚀 INICIANDO ETL PNCP → CockroachDB")
+    logger.info("="*80)
+    
+    try:
+        logger.info("📝 Etapa 1: Inicialização de tabelas")
+        init_control_tables()
+        
+        logger.info("📝 Etapa 2: Obtenção de IDs SMS")
+        sms_ids = get_filtered_sheets_ids()
+        
+        logger.info("📝 Etapa 3: Obtenção de IDs Catálogo")
+        outros_ids = get_new_precos_catalogo_ids()
 
-    sms_ids = get_filtered_sheets_ids()
-    outros_ids = get_new_precos_catalogo_ids()
+        all_ids = sms_ids + outros_ids
+        seen = set()
+        unique = []
+        for idc, o in all_ids:
+            if idc not in seen:
+                seen.add(idc)
+                unique.append((idc, o))
+        
+        logger.info(f"📊 Total de IDs únicos para processar: {len(unique)}")
+        
+        if not unique:
+            logger.info("ℹ️ Nenhum ID para processar. Finalizando.")
+            return
 
-    all_ids = sms_ids + outros_ids
-    seen = set()
-    unique = []
-    for idc, o in all_ids:
-        if idc not in seen:
-            seen.add(idc)
-            unique.append((idc, o))
+        for idx, (idc, o) in enumerate(unique, 1):
+            logger.info(f"📍 Progresso: {idx}/{len(unique)}")
+            process_single_id(idc, o)
+            time.sleep(2)
+        
+        logger.info("="*80)
+        logger.info("✅ ETL CONCLUÍDO COM SUCESSO")
+        logger.info("="*80)
+        
+    except Exception as e:
+        logger.error(f"❌ ERRO CRÍTICO: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)
 
-    for idc, o in unique:
-        process_single_id(idc, o)
-        time.sleep(2)
+print("🔍 DEBUG: Chegando ao if __name__ == '__main__'")
 
 if __name__ == "__main__":
+    print("🔍 DEBUG: Entrando no bloco principal")
     main()
+    print("🔍 DEBUG: main() concluído")
