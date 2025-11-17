@@ -24,17 +24,17 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install -r requirements.txt
+ 
+      - name: Write GCP credentials file
+        run: |
+          echo "${{ secrets.GCP_SA_KEY }}" > gcp-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp-key.json" >> $GITHUB_ENV
 
       - name: Debug JSON content
         run: |
           echo "------ INÍCIO DO ARQUIVO ------"
           cat gcp-key.json
           echo "------ FIM DO ARQUIVO ------"
-      
-      - name: Write GCP credentials file
-        run: |
-          echo "${{ secrets.GCP_SA_KEY }}" > gcp-key.json
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp-key.json" >> $GITHUB_ENV
 
       - name: Run ETL Script
         env:
