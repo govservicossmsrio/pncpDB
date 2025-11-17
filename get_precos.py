@@ -43,7 +43,7 @@ CONFIG = {
     "MAX_CONSECUTIVE_API_ERRORS": 6,
     "MAX_ERRORS_PER_CODE": 10,
     "EXECUTION_TIME_LIMIT_HOURS": 1,
-    "SCRIPT_VERSION": "v2.1.0",
+    "SCRIPT_VERSION": "v2.1.1",
     
     # ===== MODO TESTE =====
     "MODO_TESTE": False,
@@ -161,7 +161,8 @@ def initialize_sheets_tab():
         values = sheet.get_all_values()
         if not values or values[0] != ["cod_br", "idcompra", "status", "ultima_busca"]:
             logger.info("📝 Configurando cabeçalhos da planilha...")
-            sheet.update('A1:D1', [["cod_br", "idcompra", "status", "ultima_busca"]])
+            # CORREÇÃO: Ordem correta dos argumentos (values primeiro)
+            sheet.update(values=[["cod_br", "idcompra", "status", "ultima_busca"]], range_name='A1:D1')
             logger.info("✅ Cabeçalhos configurados")
         
         return sheet
@@ -299,6 +300,10 @@ def convert_brazilian_number_to_decimal(value) -> Optional[str]:
     
     value_str = str(value).strip()
     
+    # Trata strings que representam valores nulos
+    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>']:
+        return None
+    
     # Remove pontos de milhar e troca vírgula por ponto
     # Formato brasileiro: 1.234.567,89
     # Formato americano: 1234567.89
@@ -308,10 +313,81 @@ def convert_brazilian_number_to_decimal(value) -> Optional[str]:
     return value_str
 
 def convert_to_string_safe(value) -> Optional[str]:
-    """Converte valor para string de forma segura, retornando None para vazios"""
-    if pd.isna(value) or value is None or value == '' or str(value).strip() == '':
+    """
+    Converte valor para string de forma segura, retornando None para vazios
+    
+    CORREÇÃO: Trata strings "null", "None", "nan" como None
+    """
+    if pd.isna(value) or value is None or value == '':
         return None
-    return str(value).strip()
+    
+    value_str = str(value).strip()
+    
+    # Trata strings que representam valores nulos
+    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>']:
+        return None
+    
+    if value_str == '':
+        return None
+    
+    return value_str
+
+def convert_to_integer_safe(value) -> Optional[int]:
+    """
+    Converte valor para integer de forma segura, retornando None para inválidos
+    
+    NOVO: Função específica para campos INTEGER
+    """
+    if pd.isna(value) or value is None or value == '':
+        return None
+    
+    value_str = str(value).strip()
+    
+    # Trata strings que representam valores nulos
+    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>', '']:
+        return None
+    
+    # Remove decimais se for número float (ex: "123.0" -> "123")
+    if '.' in value_str:
+        try:
+            float_val = float(value_str)
+            if float_val.is_integer():
+                value_str = str(int(float_val))
+            else:
+                # Se tem decimal não-zero, tenta arredondar
+                value_str = str(round(float_val))
+        except:
+            return None
+    
+    try:
+        return int(value_str)
+    except (ValueError, TypeError):
+        logger.warning(f"⚠️ Não foi possível converter '{value_str}' para INTEGER - usando None")
+        return None
+
+def convert_to_date_safe(value) -> Optional[str]:
+    """
+    Converte valor para data de forma segura, retornando None para inválidos
+    
+    NOVO: Função específica para campos DATE
+    """
+    if pd.isna(value) or value is None or value == '':
+        return None
+    
+    value_str = str(value).strip()
+    
+    # Trata strings que representam valores nulos
+    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>', '']:
+        return None
+    
+    # Tenta converter para data
+    try:
+        date_obj = pd.to_datetime(value_str, errors='coerce')
+        if pd.isna(date_obj):
+            return None
+        return date_obj.strftime('%Y-%m-%d')
+    except:
+        return None
 
 def check_execution_time() -> bool:
     """Verifica se o tempo de execução foi excedido"""
@@ -665,7 +741,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     logger.debug("🔨 Construindo coluna idcompraitem...")
     df['idcompraitem_construido'] = (
         df['id_compra'].astype(str).str.strip() + 
-        df['numero_item_compra'].astype(str).str.strip().str.zfill(5)
+        df['numero_item_compra'].astype(str).str.strip().str.replace('.0', '', regex=False).str.zfill(5)
     )
     logger.debug(f"✓ idcompraitem construído (exemplo): {df['idcompraitem_construido'].iloc[0]}")
     
@@ -692,14 +768,14 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"📊 Registros após deduplicação: {len(df)}")
     
     # =====================================================
-    # MAPEAMENTO COM CONVERSÃO NUMÉRICA
+    # MAPEAMENTO COM CONVERSÃO CORRIGIDA
     # =====================================================
     logger.debug("🔄 Mapeando colunas para o schema do banco...")
     
     column_mapping = {
         'idcompraitem_construido': ('idcompraitem', 'string'),
         'id_compra': ('idcompra', 'string'),
-        'numero_item_compra': ('numeroitemcompra', 'string'),
+        'numero_item_compra': ('numeroitemcompra', 'integer'),  # ← CORRIGIDO
         'codigo_item_catalogo': ('coditemcatalogo', 'string'),
         'descricao_item': ('descricaodetalhada', 'string'),
         'quantidade': ('quantidadehomologada', 'decimal'),
@@ -712,7 +788,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
         'codigo_uasg': ('unidadeorgaocodigounidade', 'string'),
         'nome_uasg': ('unidadeorgaonomeunidade', 'string'),
         'estado': ('unidadeorgaouf', 'string'),
-        'data_compra': ('datacompra', 'string'),
+        'data_compra': ('datacompra', 'date'),  # ← CORRIGIDO
     }
     
     result_data = {}
@@ -722,6 +798,12 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
             if col_type == 'decimal':
                 logger.debug(f"🔢 Convertendo campo numérico: {csv_col} → {schema_col}")
                 result_data[schema_col] = df[csv_col].apply(convert_brazilian_number_to_decimal)
+            elif col_type == 'integer':
+                logger.debug(f"🔢 Convertendo campo inteiro: {csv_col} → {schema_col}")
+                result_data[schema_col] = df[csv_col].apply(convert_to_integer_safe)
+            elif col_type == 'date':
+                logger.debug(f"📅 Convertendo campo data: {csv_col} → {schema_col}")
+                result_data[schema_col] = df[csv_col].apply(convert_to_date_safe)
             else:
                 result_data[schema_col] = df[csv_col].apply(convert_to_string_safe)
             
@@ -747,7 +829,7 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     
     # Verificação de colunas NULL críticas
     logger.debug("🔍 Verificando colunas críticas...")
-    colunas_criticas = ['quantidadehomologada', 'unidademedida', 'valorunitariohomologado']
+    colunas_criticas = ['quantidadehomologada', 'unidademedida', 'valorunitariohomologado', 'numeroitemcompra']
     for col in colunas_criticas:
         null_count = result_df[col].isna().sum()
         not_null_count = result_df[col].notna().sum()
@@ -1081,8 +1163,8 @@ def main():
             
             # Delay entre lotes
             if i + CONFIG["PARALLEL_REQUESTS"] < len(pending_codes):
-                logger.debug(f"⏳ Aguardando {CONFIG['SUCCESS_DELAY_SECONDS']}s antes do próximo lote...")
-                time.sleep(CONFIG["SUCCESS_DELAY_SECONDS"])
+                logger.debug(f"⏳ Aguardando 2s antes do próximo lote...")
+                time.sleep(2)
         
         # Relatório final
         elapsed_time = datetime.now() - execution_start_time
