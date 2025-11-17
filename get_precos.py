@@ -43,7 +43,7 @@ CONFIG = {
     "MAX_CONSECUTIVE_API_ERRORS": 6,
     "MAX_ERRORS_PER_CODE": 10,
     "EXECUTION_TIME_LIMIT_HOURS": 1,
-    "SCRIPT_VERSION": "v2.1.2",
+    "SCRIPT_VERSION": "v2.2.0",
     
     # ===== MODO TESTE =====
     "MODO_TESTE": False,
@@ -67,9 +67,10 @@ logger = logging.getLogger(__name__)
 execution_start_time = None
 should_stop = False
 db_errors_log = []
+db_schema_cache = None  # Cache do schema do banco
 
 # =====================================================
-# SCHEMA PRECOS_CATALOGO
+# SCHEMA PRECOS_CATALOGO (PADRÃO - SERÁ SOBRESCRITO PELO BANCO)
 # =====================================================
 
 PRECOS_SCHEMA = {
@@ -106,6 +107,137 @@ class DatabaseError(Exception):
 class DataValidationError(Exception):
     """Erro de validação de dados (CSV malformado)"""
     pass
+
+# =====================================================
+# FUNÇÕES DE CONVERSÃO DE TIPOS
+# =====================================================
+
+def convert_to_safe_value(value, db_type: str) -> Optional[str]:
+    """
+    Converte valor para o tipo esperado pelo banco de forma segura
+    
+    Args:
+        value: Valor original
+        db_type: Tipo no banco (INT, STRING, DECIMAL, DATE, etc)
+    
+    Returns:
+        Valor convertido ou None se inválido
+    """
+    # Trata valores nulos primeiro
+    if pd.isna(value) or value is None or value == '':
+        return None
+    
+    value_str = str(value).strip()
+    
+    # Trata strings que representam valores nulos
+    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>', '']:
+        return None
+    
+    # Conversão baseada no tipo do banco
+    if 'INT' in db_type.upper():
+        # Campo INTEGER - remove decimais e valida
+        try:
+            # Remove .0 de float strings
+            if '.' in value_str:
+                float_val = float(value_str.replace(',', '.'))
+                if float_val.is_integer():
+                    return str(int(float_val))
+                else:
+                    # Tenta arredondar
+                    return str(round(float_val))
+            
+            # Valida se é número
+            int(value_str)
+            return value_str
+        except (ValueError, TypeError):
+            logger.warning(f"⚠️ Valor '{value_str}' inválido para tipo INTEGER - usando NULL")
+            return None
+    
+    elif 'DECIMAL' in db_type.upper() or 'FLOAT' in db_type.upper() or 'NUMERIC' in db_type.upper():
+        # Campo numérico - converte vírgula para ponto
+        try:
+            # Remove pontos de milhar, troca vírgula por ponto
+            clean_val = value_str.replace('.', '').replace(',', '.')
+            # Valida se é número
+            float(clean_val)
+            return clean_val
+        except (ValueError, TypeError):
+            logger.warning(f"⚠️ Valor '{value_str}' inválido para tipo DECIMAL - usando NULL")
+            return None
+    
+    elif 'DATE' in db_type.upper() or 'TIME' in db_type.upper():
+        # Campo de data/hora
+        try:
+            # Tenta fazer parse da data
+            date_obj = pd.to_datetime(value_str, errors='coerce')
+            if pd.isna(date_obj):
+                return None
+            
+            if 'TIME' in db_type.upper() and 'DATE' in db_type.upper():
+                # TIMESTAMP/DATETIME
+                return date_obj.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                # DATE apenas
+                return date_obj.strftime('%Y-%m-%d')
+        except:
+            logger.warning(f"⚠️ Valor '{value_str}' inválido para tipo DATE - usando NULL")
+            return None
+    
+    else:
+        # STRING ou outros tipos - apenas limpa
+        # Remove .0 de números inteiros
+        if value_str.endswith('.0') and value_str.replace('.', '').replace('-', '').isdigit():
+            value_str = value_str[:-2]
+        
+        return value_str
+
+# =====================================================
+# SCHEMA DO BANCO - DETECÇÃO AUTOMÁTICA
+# =====================================================
+
+def get_table_schema(table_name: str = "precos_catalogo") -> Dict[str, str]:
+    """
+    Obtém o schema real da tabela do banco de dados
+    
+    Returns:
+        Dict com {nome_coluna: tipo_dado}
+    """
+    global db_schema_cache
+    
+    # Retorna do cache se já foi consultado
+    if db_schema_cache is not None:
+        return db_schema_cache
+    
+    try:
+        logger.info(f"🔍 Consultando schema real da tabela {table_name}...")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute(f"""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = '{table_name}'
+            ORDER BY ordinal_position
+        """)
+        
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        schema = {}
+        for col_name, col_type in results:
+            schema[col_name] = col_type.upper()
+            logger.debug(f"  ✓ {col_name}: {col_type}")
+        
+        db_schema_cache = schema
+        logger.info(f"✅ Schema obtido: {len(schema)} colunas")
+        
+        return schema
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao obter schema da tabela: {e}")
+        # Retorna schema padrão em caso de erro
+        return {k: "STRING" for k in PRECOS_SCHEMA.keys()}
 
 # =====================================================
 # GOOGLE SHEETS - FUNÇÕES
@@ -279,58 +411,6 @@ def normalizar_nome_coluna(nome: str) -> str:
     s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
     s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
-
-def convert_brazilian_number_to_string(value) -> Optional[str]:
-    """
-    Converte número brasileiro para formato de ponto decimal, mas retorna STRING
-    
-    Exemplos:
-        "1,00" → "1.00"
-        "4.668,00" → "4668.00"
-        "19.760,00" → "19760.00"
-        "" → None
-        None → None
-    """
-    if pd.isna(value) or value is None or value == '':
-        return None
-    
-    value_str = str(value).strip()
-    
-    # Trata strings que representam valores nulos
-    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>']:
-        return None
-    
-    if value_str == '':
-        return None
-    
-    # Remove pontos de milhar e troca vírgula por ponto
-    value_str = value_str.replace('.', '')  # Remove pontos de milhar
-    value_str = value_str.replace(',', '.')  # Troca vírgula por ponto
-    
-    return value_str
-
-def convert_to_string_safe(value) -> Optional[str]:
-    """
-    Converte valor para string de forma segura, retornando None para vazios
-    Remove .0 de números inteiros
-    """
-    if pd.isna(value) or value is None or value == '':
-        return None
-    
-    value_str = str(value).strip()
-    
-    # Trata strings que representam valores nulos
-    if value_str.lower() in ['null', 'none', 'nan', 'nat', '<na>']:
-        return None
-    
-    if value_str == '':
-        return None
-    
-    # Remove .0 de números inteiros (ex: "123.0" -> "123")
-    if value_str.endswith('.0') and value_str.replace('.', '').replace('-', '').isdigit():
-        value_str = value_str[:-2]
-    
-    return value_str
 
 def check_execution_time() -> bool:
     """Verifica se o tempo de execução foi excedido"""
@@ -668,6 +748,9 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"📊 Registros no CSV original: {len(df)}")
     logger.debug(f"📋 Total de colunas no CSV: {len(df.columns)}")
     
+    # Obtém schema real do banco
+    db_schema = get_table_schema()
+    
     # Normalização
     logger.debug("🔧 Normalizando nomes das colunas...")
     df.columns = [normalizar_nome_coluna(col) for col in df.columns]
@@ -711,43 +794,41 @@ def map_csv_to_schema(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"📊 Registros após deduplicação: {len(df)}")
     
     # =====================================================
-    # MAPEAMENTO - TODOS OS CAMPOS COMO STRING
+    # MAPEAMENTO COM CONVERSÃO BASEADA NO SCHEMA DO BANCO
     # =====================================================
     logger.debug("🔄 Mapeando colunas para o schema do banco...")
     
     column_mapping = {
-        'idcompraitem_construido': ('idcompraitem', 'string'),
-        'id_compra': ('idcompra', 'string'),
-        'numero_item_compra': ('numeroitemcompra', 'string'),
-        'codigo_item_catalogo': ('coditemcatalogo', 'string'),
-        'descricao_item': ('descricaodetalhada', 'string'),
-        'quantidade': ('quantidadehomologada', 'numeric_string'),
-        'sigla_unidade_medida': ('unidademedida', 'string'),
-        'preco_unitario': ('valorunitariohomologado', 'numeric_string'),
-        'percentual_maior_desconto': ('percentualdesconto', 'numeric_string'),
-        'marca': ('marca', 'string'),
-        'ni_fornecedor': ('nifornecedor', 'string'),
-        'nome_fornecedor': ('nomefornecedor', 'string'),
-        'codigo_uasg': ('unidadeorgaocodigounidade', 'string'),
-        'nome_uasg': ('unidadeorgaonomeunidade', 'string'),
-        'estado': ('unidadeorgaouf', 'string'),
-        'data_compra': ('datacompra', 'string'),
+        'idcompraitem_construido': 'idcompraitem',
+        'id_compra': 'idcompra',
+        'numero_item_compra': 'numeroitemcompra',
+        'codigo_item_catalogo': 'coditemcatalogo',
+        'descricao_item': 'descricaodetalhada',
+        'quantidade': 'quantidadehomologada',
+        'sigla_unidade_medida': 'unidademedida',
+        'preco_unitario': 'valorunitariohomologado',
+        'percentual_maior_desconto': 'percentualdesconto',
+        'marca': 'marca',
+        'ni_fornecedor': 'nifornecedor',
+        'nome_fornecedor': 'nomefornecedor',
+        'codigo_uasg': 'unidadeorgaocodigounidade',
+        'nome_uasg': 'unidadeorgaonomeunidade',
+        'estado': 'unidadeorgaouf',
+        'data_compra': 'datacompra',
     }
     
     result_data = {}
     
-    for csv_col, (schema_col, col_type) in column_mapping.items():
+    for csv_col, schema_col in column_mapping.items():
         if csv_col in df.columns:
-            if col_type == 'numeric_string':
-                # Converte vírgula para ponto mas mantém como STRING
-                logger.debug(f"🔢 Convertendo campo numérico: {csv_col} → {schema_col}")
-                result_data[schema_col] = df[csv_col].apply(convert_brazilian_number_to_string)
-            else:
-                # String normal
-                result_data[schema_col] = df[csv_col].apply(convert_to_string_safe)
+            # Obtém o tipo do banco para esta coluna
+            db_type = db_schema.get(schema_col, 'STRING')
+            
+            # Converte usando a função inteligente
+            result_data[schema_col] = df[csv_col].apply(lambda x: convert_to_safe_value(x, db_type))
             
             not_null_count = result_data[schema_col].notna().sum()
-            logger.debug(f"✓ {csv_col} → {schema_col} ({not_null_count}/{len(df)} não-nulos)")
+            logger.debug(f"✓ {csv_col} → {schema_col} [{db_type}] ({not_null_count}/{len(df)} não-nulos)")
         else:
             if schema_col != 'marca':
                 logger.debug(f"⚠️ Coluna '{csv_col}' não encontrada no CSV")
