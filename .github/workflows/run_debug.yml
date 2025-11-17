@@ -1,0 +1,40 @@
+name: Debug Schema Mapping
+
+on:
+  workflow_dispatch:  # Execução manual apenas
+
+jobs:
+  run-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    permissions:
+      contents: 'read'
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Dependencies
+        run: |
+          pip install pandas psycopg2-binary
+      
+      - name: Run Debug Script
+        env:
+          COCKROACH_CONNECTION_STRING: ${{ secrets.COCKROACH_CONNECTION_STRING }}
+        run: |
+          python -u debug.py
+      
+      - name: Upload Debug Output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: |
+            *.log
+          retention-days: 7
