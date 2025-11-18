@@ -17,8 +17,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Esta etapa configura a autenticação no ambiente.
-      # A seção 'scopes' foi REMOVIDA pois estava incorreta e causava o erro.
       - name: Authenticate to Google Cloud
         id: auth
         uses: 'google-github-actions/auth@v2'
