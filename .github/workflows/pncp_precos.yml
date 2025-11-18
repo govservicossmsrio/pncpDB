@@ -3,12 +3,12 @@ name: PNCP Preços
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'  # 02:00 AM todos os dias (UTC)
+    - cron: '0 2 * * *'  
 
 jobs:
   run-precos-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 90  # 1h30 (mais margem que o limite do script de 1h)
+    timeout-minutes: 90  
     
     permissions:
       contents: 'read'
